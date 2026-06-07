@@ -1,0 +1,28 @@
+# Rust native build output
+native/target/
+
+# Flutter build output
+build/
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Android
+android/.gradle/
+android/app/src/main/jniLibs/
+
+# iOS
+ios/Pods/
+ios/Frameworks/
+ios/.symlinks/
+ios/Flutter/App.framework
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+ios/Flutter/Generated.xcconfig
+ios/Flutter/app.flx
+ios/Flutter/app.zip
+ios/Flutter/flutter_assets/
+
+# Xcode
+*.xcworkspace
+!ios/Runner.xcworkspace
