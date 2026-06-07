@@ -1,0 +1,59 @@
+name: arkos_mobile
+description: Arkos — quantum-proof blockchain mobile miner
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+  flutter: '>=3.19.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # HTTP + networking
+  http: ^1.2.0
+  web_socket_channel: ^2.4.0
+
+  # State management
+  provider: ^6.1.2
+
+  # Secure key storage (wraps iOS Keychain / Android Keystore)
+  flutter_secure_storage: ^9.0.0
+
+  # Shared preferences (non-sensitive settings)
+  shared_preferences: ^2.2.3
+
+  # Biometrics / device auth (unlocks wallet)
+  local_auth: ^2.2.0
+
+  # Pretty number formatting (hashrate, balances)
+  intl: ^0.19.0
+
+  # Charts for hashrate history
+  fl_chart: ^0.67.0
+
+  # Icons
+  cupertino_icons: ^1.0.8
+
+  # Crypto utilities
+  crypto: ^3.0.3
+  convert: ^3.1.1
+  pointycastle: ^3.9.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  build_runner: ^2.4.8
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/images/
+  fonts:
+    - family: ArkosFont
+      fonts:
+        - asset: assets/fonts/SpaceGrotesk-Regular.ttf
+        - asset: assets/fonts/SpaceGrotesk-Bold.ttf
+          weight: 700

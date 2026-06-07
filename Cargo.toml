@@ -1,0 +1,52 @@
+[package]
+name = "arkos"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "arkos"
+path = "src/lib.rs"
+
+[[bin]]
+name = "arkos"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"
+
+[dependencies]
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+secp256k1 = { version = "0.28", features = ["rand", "serde"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand = "0.8"
+tokio = { version = "1", features = ["full"] }
+bincode = "1"
+rocksdb = "0.21"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+# --- Security layer ---
+aes-gcm = "0.10"         # AES-256-GCM authenticated encryption (wallet encryption at rest)
+argon2 = "0.5"            # Argon2id key derivation (password → encryption key, GPU/ASIC-resistant)
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }  # Ed25519 for peer auth & access tokens
+hmac = "0.12"             # HMAC for message authentication
+zeroize = { version = "1", features = ["derive"] }  # Zero out secrets from memory when dropped
+base64 = "0.22"           # Encoding for tokens
+rpassword = "7"           # Secure password prompt (no echo to terminal)
+# --- Post-quantum layer ---
+pqcrypto-dilithium = "0.5"  # CRYSTALS-Dilithium (NIST FIPS 204 / ML-DSA) — quantum-safe signatures
+pqcrypto-traits = "0.3"     # Traits for post-quantum crypto
+# --- Constant-time comparisons (prevents timing attacks on token auth) ---
+subtle = "2"
+# --- Noise Protocol (Noise_XX_25519_ChaChaPoly_BLAKE2s P2P transport encryption) ---
+snow = "0.9"
+# --- RPC / HTTP API layer ---
+axum = { version = "0.7", features = ["json"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }

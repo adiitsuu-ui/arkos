@@ -1,0 +1,29 @@
+[package]
+name    = "arkos_mobile"
+version = "0.1.0"
+edition = "2021"
+
+# cdylib  → .so (Android), .dylib (macOS dev)
+# staticlib → .a  (iOS — Xcode links static libraries)
+[lib]
+name  = "arkos_mobile"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+sha2 = "0.10"
+hex  = "0.4"
+
+# iOS targets
+[target.'cfg(target_os = "ios")'.dependencies]
+# nothing extra needed
+
+# Android targets
+[target.'cfg(target_os = "android")'.dependencies]
+# nothing extra needed
+
+# ─── Cross-compilation profiles ──────────────────────────────────────────────
+[profile.release]
+opt-level     = 3
+lto           = true       # Link-time optimisation — smaller, faster binary
+codegen-units = 1
+strip         = true       # Strip debug symbols from the library
