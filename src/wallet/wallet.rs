@@ -58,8 +58,10 @@ impl Wallet {
 
     /// Generate a new wallet and return it together with its 24-word BIP39
     /// recovery phrase.  The phrase encodes the ECDSA private key; restoring
-    /// it via [`from_phrase`] recovers the same address.  The Dilithium key
-    /// is always freshly generated — it is stored in the vault, not the phrase.
+    /// it via [`from_phrase`] recovers the same ECDSA key and the same
+    /// ML-DSA-65 key (derived deterministically via HMAC-SHA256 from the
+    /// ECDSA secret).  See the quantum module for the security caveat on
+    /// phrase-only recovery.
     pub fn generate_with_phrase() -> (Self, String) {
         use bip39::{Language, Mnemonic};
         use rand::RngCore;
@@ -83,9 +85,11 @@ impl Wallet {
 
     /// Restore a wallet from a 24-word BIP39 recovery phrase.
     ///
-    /// The phrase must be 24 words (256-bit entropy).  The ECDSA key and
-    /// address are fully recovered.  The Dilithium key is freshly generated;
-    /// future spends from this wallet use the new Dilithium key.
+    /// The phrase must be 24 words (256-bit entropy).  Both the ECDSA key
+    /// and the ML-DSA-65 key are fully recovered — the ML-DSA seed is
+    /// derived deterministically from the ECDSA secret (HMAC-SHA256 with
+    /// domain tag "arkos-mldsa-v1"), so the same phrase always restores
+    /// the same address and signing keys.
     pub fn from_phrase(phrase: &str) -> Result<Self> {
         use bip39::{Language, Mnemonic};
         let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase)
@@ -105,6 +109,7 @@ impl Wallet {
         amount: u64,
         fee: u64,
         utxo_set: &UtxoSet,
+        network_magic: u32,
     ) -> Result<Transaction> {
         let my_addr = self.address();
         let mut utxos = utxo_set.utxos_for(&my_addr);
@@ -152,7 +157,7 @@ impl Wallet {
             .collect();
 
         let unsigned = Transaction::new(inputs_unsigned, outputs.clone());
-        let sig_hash = unsigned.sig_hash();
+        let sig_hash = unsigned.sig_hash(network_magic);
         let sig_message = sig_hash;
         let signature = self.keypair.sign(&sig_message);
 
