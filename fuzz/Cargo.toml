@@ -1,0 +1,38 @@
+[package]
+name = "arkos-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arkos = { path = ".." }
+bincode = "1"
+serde_json = "1"
+
+[[bin]]
+name = "fuzz_block_deser"
+path = "fuzz_targets/fuzz_block_deser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_tx_deser"
+path = "fuzz_targets/fuzz_tx_deser.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_p2p_parse"
+path = "fuzz_targets/fuzz_p2p_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_hybrid_pubkey"
+path = "fuzz_targets/fuzz_hybrid_pubkey.rs"
+test = false
+doc = false

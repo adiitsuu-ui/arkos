@@ -1,0 +1,14 @@
+prefix=/home/lunna/arkos/fuzz/target/debug/build/libz-sys-78de498b2c1a19b3/out
+exec_prefix=@exec_prefix@
+libdir=${prefix}/lib
+sharedlibdir=@sharedlibdir@
+includedir=${prefix}/include
+
+Name: zlib
+Description: zlib compression library
+Version: 1.3.2
+License: Zlib
+
+Requires:
+Libs: -L${libdir} -L${sharedlibdir} -lz
+Cflags: -I${includedir}
