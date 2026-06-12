@@ -447,7 +447,7 @@ async fn main() -> Result<()> {
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         Command::Node { miner } => {
             std::fs::create_dir_all(&network_datadir)?;
-            let chain = Blockchain::open(chain_path.to_string_lossy().as_ref())?;
+            let chain = Blockchain::open_for_network(chain_path.to_string_lossy().as_ref(), &cli.network)?;
             if let Some(miner_addr) = miner {
                 info!(
                     "Miner address configured: {}. Mine with `arkos mine` or submit blocks via RPC.",
@@ -499,7 +499,7 @@ async fn main() -> Result<()> {
 
         Command::Mine { address } => {
             std::fs::create_dir_all(&network_datadir)?;
-            let mut chain = Blockchain::open(chain_path.to_string_lossy().as_ref())?;
+            let mut chain = Blockchain::open_for_network(chain_path.to_string_lossy().as_ref(), &cli.network)?;
             let block = chain.mine_block(&address);
             println!("Mined block: {}", block.hash_hex());
             println!("Height     : {}", block.height);
@@ -511,7 +511,7 @@ async fn main() -> Result<()> {
 
         Command::Balance { address } => {
             std::fs::create_dir_all(&network_datadir)?;
-            let chain = Blockchain::open(chain_path.to_string_lossy().as_ref())?;
+            let chain = Blockchain::open_for_network(chain_path.to_string_lossy().as_ref(), &cli.network)?;
             println!(
                 "Balance of {}: {} arkes",
                 address,
@@ -533,10 +533,10 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("wallet '{}' not found in vault", from_label))?;
 
             std::fs::create_dir_all(&network_datadir)?;
-            let mut chain = Blockchain::open(chain_path.to_string_lossy().as_ref())?;
+            let mut chain = Blockchain::open_for_network(chain_path.to_string_lossy().as_ref(), &cli.network)?;
             let w = Wallet::from_secret_hex(&contents.secret_keys[idx])?;
             println!("From: {} ({})", from_label, w.address());
-            let tx = w.send(&to, amount, 1000, &chain.utxo_set)?;
+            let tx = w.send(&to, amount, 1000, &chain.utxo_set, chain.network_magic)?;
             let txid = chain.submit_transaction(tx)?;
             println!("Transaction submitted: {}", txid);
             let block = chain.mine_block(&w.address());
@@ -546,7 +546,7 @@ async fn main() -> Result<()> {
 
         Command::Info => {
             std::fs::create_dir_all(&network_datadir)?;
-            let chain = Blockchain::open(chain_path.to_string_lossy().as_ref())?;
+            let chain = Blockchain::open_for_network(chain_path.to_string_lossy().as_ref(), &cli.network)?;
             println!("Height     : {}", chain.height());
             println!("Tip hash   : {}", chain.tip().hash_hex());
             println!("Difficulty : 0x{:08x}", chain.tip().header.bits);
@@ -565,7 +565,7 @@ async fn main() -> Result<()> {
             println!("   Miner    addr : {}", miner_wallet.address());
             println!("   Receiver addr : {}", receiver_wallet.address());
 
-            let mut chain = Blockchain::new();
+            let mut chain = Blockchain::new_for_network(&cli.network);
             println!("\n② Genesis block:");
             println!("   Hash   : {}", chain.tip().hash_hex());
             println!("   Height : {}", chain.height());
@@ -600,6 +600,7 @@ async fn main() -> Result<()> {
                 send_amount,
                 fee,
                 &chain.utxo_set,
+                chain.network_magic,
             )?;
             let txid = chain.submit_transaction(tx)?;
             println!("   TX submitted  txid={:.16}...", txid);
@@ -644,9 +645,11 @@ async fn main() -> Result<()> {
                     },
                     pubkey: miner_wallet.keypair.public_key(),
                     coinbase_extra: vec![],
+                    witnesses: vec![],
                 }],
                 vec![TxOutput {
                     value: 999_999_999_999,
+                    script: None,
                     address: receiver_wallet.address(),
                 }],
             );

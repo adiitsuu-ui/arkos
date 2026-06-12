@@ -53,14 +53,14 @@ pub struct HybridKeyPair {
 }
 
 /// A hybrid signature: both ECDSA and ML-DSA signatures
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HybridSignature {
     pub ecdsa_sig: Vec<u8>,      // 64 bytes (compact ECDSA)
     pub dilithium_sig: Vec<u8>,  // 3,309 bytes (ML-DSA-65)
 }
 
 /// A hybrid public key for verification
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HybridPublicKey {
     pub ecdsa_pubkey: Vec<u8>,     // 33 bytes (compressed secp256k1)
     pub dilithium_pubkey: Vec<u8>, // 1,952 bytes (ML-DSA-65 encoded verifying key)

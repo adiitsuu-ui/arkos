@@ -137,12 +137,14 @@ impl Wallet {
 
         let mut outputs = vec![TxOutput {
             value: amount,
+            script: None,
             address: recipient.to_string(),
         }];
         let change = collected - needed;
         if change > 0 {
             outputs.push(TxOutput {
                 value: change,
+                script: None,
                 address: my_addr.clone(),
             });
         }
@@ -159,6 +161,7 @@ impl Wallet {
                 },
                 pubkey: self.keypair.public_key(),
                 coinbase_extra: vec![],
+                witnesses: vec![],
             })
             .collect();
 
@@ -176,6 +179,7 @@ impl Wallet {
                 signature: signature.clone(),
                 pubkey: self.keypair.public_key(),
                 coinbase_extra: vec![],
+                witnesses: vec![],
             })
             .collect();
 

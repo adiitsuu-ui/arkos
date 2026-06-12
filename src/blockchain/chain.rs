@@ -508,9 +508,78 @@ impl Default for Blockchain {
     }
 }
 
+/// Evaluate a locking script against a spending input.
+///
+/// Returns `Ok(())` if the input satisfies the script, `Err(...)` otherwise.
+fn evaluate_script(
+    script: &crate::transaction::tx::Script,
+    input: &crate::transaction::tx::TxInput,
+    sig_hash: &crate::crypto::hash::Hash,
+    block_time: u64,
+) -> Result<()> {
+    use crate::transaction::tx::Script;
+    match script {
+        Script::P2PKH { address } => {
+            // One valid signature from the key that hashes to `address`.
+            let pubkey = secp256k1::PublicKey::from_slice(&input.pubkey.ecdsa_pubkey)
+                .map_err(|_| anyhow::anyhow!("invalid ECDSA pubkey"))?;
+            input.signature.verify(sig_hash, &input.pubkey)
+                .map_err(|e| anyhow::anyhow!("P2PKH signature invalid: {}", e))?;
+            let derived_addr = hex::encode(
+                hybrid_pubkey_to_address(&pubkey, &input.pubkey.dilithium_pubkey)
+            );
+            if &derived_addr != address {
+                bail!("P2PKH pubkey does not match address");
+            }
+            Ok(())
+        }
+        Script::P2MS { m, pubkeys } => {
+            // Collect all (sig, pubkey) pairs: the primary input slot + witnesses
+            let mut signers: Vec<_> = std::iter::once((&input.signature, &input.pubkey))
+                .chain(input.witnesses.iter().map(|(s, p)| (s, p)))
+                .collect();
+            signers.truncate(*m as usize);
+            if signers.len() < *m as usize {
+                bail!("P2MS: need {} sigs, got {}", m, signers.len());
+            }
+            let mut valid_count = 0u8;
+            'outer: for (sig, pk) in &signers {
+                for allowed_pk in pubkeys {
+                    if allowed_pk.ecdsa_pubkey == pk.ecdsa_pubkey
+                        && allowed_pk.dilithium_pubkey == pk.dilithium_pubkey
+                    {
+                        if sig.verify(sig_hash, pk).is_ok() {
+                            valid_count += 1;
+                            continue 'outer;
+                        }
+                    }
+                }
+            }
+            if valid_count < *m {
+                bail!("P2MS: only {}/{} valid signatures", valid_count, m);
+            }
+            Ok(())
+        }
+        Script::TimeLocked { lock_until, inner } => {
+            if block_time < *lock_until {
+                bail!(
+                    "CLTV: output locked until {} (current block time ~{})",
+                    lock_until, block_time
+                );
+            }
+            evaluate_script(inner, input, sig_hash, block_time)
+        }
+    }
+}
+
 fn validate_tx_with_utxo(tx: &Transaction, utxo_set: &UtxoSet, network_magic: u32, current_height: u64) -> Result<u64> {
+    use crate::transaction::tx::Script as _Script;
+
     let mut input_sum: u64 = 0;
     let sig_hash = tx.sig_hash(network_magic);
+    // Block time in seconds (approximate: use height × 10 min for CLTV purposes).
+    // A future upgrade may pass the actual block timestamp here.
+    let block_time = current_height * 600;
 
     for input in &tx.inputs {
         // Coinbase maturity check: coinbase outputs need COINBASE_MATURITY confirmations
@@ -535,25 +604,10 @@ fn validate_tx_with_utxo(tx: &Transaction, utxo_set: &UtxoSet, network_magic: u3
             .checked_add(utxo.value)
             .ok_or_else(|| anyhow::anyhow!("input sum overflow"))?;
 
-        // Verify signature
-        let pubkey = PublicKey::from_slice(&input.pubkey.ecdsa_pubkey)
-            .map_err(|_| anyhow::anyhow!("invalid pubkey"))?;
-        input
-            .signature
-            .verify(&sig_hash, &input.pubkey)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "invalid hybrid signature on input {}:{}: {}",
-                    input.prev_tx_hash,
-                    input.prev_index,
-                    e
-                )
-            })?;
-        // Verify pubkey matches address (both ECDSA + ML-DSA keys must match)
-        let derived_addr = hex::encode(hybrid_pubkey_to_address(&pubkey, &input.pubkey.dilithium_pubkey));
-        if derived_addr != utxo.address {
-            bail!("pubkey does not match UTXO address");
-        }
+        // Evaluate the locking script from the UTXO
+        let script = utxo.effective_script();
+        evaluate_script(&script, input, &sig_hash, block_time)
+            .map_err(|e| anyhow::anyhow!("script evaluation failed for {}:{}: {}", input.prev_tx_hash, input.prev_index, e))?;
     }
 
     for output in &tx.outputs {
@@ -770,14 +824,17 @@ mod tests {
                     dilithium_pubkey: vec![],
                 },
                 coinbase_extra: vec![],
+                witnesses: vec![],
             }],
             vec![
                 TxOutput {
                     value: huge,
+                    script: None,
                     address: "a".repeat(40),
                 },
                 TxOutput {
                     value: huge,
+                    script: None,
                     address: "b".repeat(40),
                 },
             ],
@@ -819,14 +876,17 @@ mod tests {
                     dilithium_pubkey: vec![],
                 },
                 coinbase_extra: height.to_le_bytes().to_vec(),
+                witnesses: vec![],
             }],
             outputs: vec![
                 TxOutput {
                     value: huge,
+                    script: None,
                     address: "miner".into(),
                 },
                 TxOutput {
                     value: huge,
+                    script: None,
                     address: "miner".into(),
                 },
             ],
