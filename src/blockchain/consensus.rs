@@ -1,4 +1,3 @@
-
 /// Target block time in seconds
 pub const TARGET_BLOCK_TIME: u64 = 194; // 3 minutes 14 seconds, Pi-themed
 /// Difficulty adjusts every N blocks
@@ -76,4 +75,3 @@ pub fn adjust_difficulty(
 pub fn validate_timestamp(block_ts: u64, median_past_time: u64, network_time: u64) -> bool {
     block_ts > median_past_time && block_ts <= network_time + 7200
 }
-

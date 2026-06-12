@@ -10,7 +10,7 @@ pub struct Utxo {
 }
 
 /// In-memory UTXO set. In production this would be backed by RocksDB.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct UtxoSet {
     // key: "txhash:index"
     utxos: HashMap<String, TxOutput>,

@@ -38,6 +38,7 @@ hmac = "0.12"             # HMAC for message authentication
 zeroize = { version = "1", features = ["derive"] }  # Zero out secrets from memory when dropped
 base64 = "0.22"           # Encoding for tokens
 rpassword = "7"           # Secure password prompt (no echo to terminal)
+bip39 = "2"               # BIP39 mnemonic phrase generation and recovery
 # --- Post-quantum layer ---
 pqcrypto-dilithium = "0.5"  # CRYSTALS-Dilithium (NIST FIPS 204 / ML-DSA) — quantum-safe signatures
 pqcrypto-traits = "0.3"     # Traits for post-quantum crypto

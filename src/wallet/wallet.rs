@@ -53,6 +53,48 @@ impl Wallet {
         ))
     }
 
+    /// Generate a new wallet and return it together with its 24-word BIP39
+    /// recovery phrase.  The phrase encodes the ECDSA private key; restoring
+    /// it via [`from_phrase`] recovers the same address.  The Dilithium key
+    /// is always freshly generated — it is stored in the vault, not the phrase.
+    pub fn generate_with_phrase() -> (Self, String) {
+        use bip39::{Language, Mnemonic};
+        use rand::RngCore;
+        let mut entropy = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut entropy);
+        let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy)
+            .expect("32-byte entropy is valid for BIP39");
+        let keypair = HybridKeyPair::from_ecdsa_secret_bytes(&entropy)
+            .expect("32-byte entropy is valid for secp256k1");
+        (Wallet { keypair }, mnemonic.to_string())
+    }
+
+    /// Derive the 24-word BIP39 recovery phrase from this wallet's ECDSA secret.
+    pub fn phrase(&self) -> String {
+        use bip39::{Language, Mnemonic};
+        let entropy = self.keypair.ecdsa_secret.secret_bytes();
+        Mnemonic::from_entropy_in(Language::English, &entropy)
+            .expect("32-byte ECDSA secret is valid BIP39 entropy")
+            .to_string()
+    }
+
+    /// Restore a wallet from a 24-word BIP39 recovery phrase.
+    ///
+    /// The phrase must be 24 words (256-bit entropy).  The ECDSA key and
+    /// address are fully recovered.  The Dilithium key is freshly generated;
+    /// future spends from this wallet use the new Dilithium key.
+    pub fn from_phrase(phrase: &str) -> Result<Self> {
+        use bip39::{Language, Mnemonic};
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase)
+            .map_err(|e| anyhow::anyhow!("invalid recovery phrase: {}", e))?;
+        let entropy = mnemonic.to_entropy();
+        if entropy.len() != 32 {
+            anyhow::bail!("phrase must be 24 words (256-bit / 32-byte entropy)");
+        }
+        let keypair = HybridKeyPair::from_ecdsa_secret_bytes(&entropy)?;
+        Ok(Wallet { keypair })
+    }
+
     /// Build and sign a transaction sending `amount` arkes to `recipient`.
     pub fn send(
         &self,

@@ -105,6 +105,22 @@ impl HybridKeyPair {
         })
     }
 
+    /// Restore a keypair from just the ECDSA secret bytes, generating a fresh
+    /// Dilithium keypair.  Used when recovering from a BIP39 mnemonic phrase,
+    /// where only the ECDSA entropy is encoded in the phrase.
+    pub fn from_ecdsa_secret_bytes(ecdsa_secret_bytes: &[u8]) -> Result<Self> {
+        let secp = Secp256k1::new();
+        let ecdsa_secret = SecretKey::from_slice(ecdsa_secret_bytes)?;
+        let ecdsa_public = PublicKey::from_secret_key(&secp, &ecdsa_secret);
+        let (pq_pk, pq_sk) = dilithium3::keypair();
+        Ok(HybridKeyPair {
+            ecdsa_secret,
+            ecdsa_public,
+            dilithium_secret: pq_sk.as_bytes().to_vec(),
+            dilithium_public: pq_pk.as_bytes().to_vec(),
+        })
+    }
+
     /// Get the hybrid public key
     pub fn public_key(&self) -> HybridPublicKey {
         HybridPublicKey {

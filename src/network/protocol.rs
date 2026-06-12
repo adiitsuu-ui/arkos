@@ -1,4 +1,4 @@
-use crate::blockchain::block::Block;
+use crate::blockchain::block::{Block, BlockHeader};
 use crate::transaction::tx::Transaction;
 use serde::{Deserialize, Serialize};
 
@@ -6,6 +6,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const MAINNET_MAGIC: u32 = 0x4152_4b53; // "ARKS"
 pub const TESTNET_MAGIC: u32 = 0x4152_4b54; // "ARKT"
 pub const REGTEST_MAGIC: u32 = 0x4152_4b52; // "ARKR"
+
+/// Maximum number of block headers returned in a single `Headers` message.
+pub const MAX_HEADERS_PER_RESPONSE: usize = 2_000;
+
+/// Maximum number of items requested in a single `GetData` batch during
+/// headers-first sync.  Caps per-round-trip memory and bandwidth.
+pub const MAX_GETDATA_INFLIGHT: usize = 50;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Message {
@@ -18,6 +25,14 @@ pub enum Message {
     },
     /// Acknowledge a Version message
     Verack,
+    /// Request block headers starting after `locator_hashes` (headers-first sync)
+    GetHeaders {
+        locator_hashes: Vec<String>,
+    },
+    /// A batch of block headers (response to `GetHeaders`)
+    Headers {
+        headers: Vec<BlockHeader>,
+    },
     /// Request blocks starting after `locator_hashes` (most recent first)
     GetBlocks {
         locator_hashes: Vec<String>,

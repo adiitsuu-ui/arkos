@@ -45,6 +45,21 @@ impl BlockHeader {
         hash_to_hex(&self.hash())
     }
 
+    /// Validate header-only (PoW check only — no UTXO, no transaction validation).
+    ///
+    /// Used during headers-first sync: validate PoW on all headers before
+    /// committing resources to download full blocks.  This prevents a malicious
+    /// peer from forcing us to download and fully validate large invalid blocks.
+    pub fn validate_header_only(&self, prev_hash: &str) -> anyhow::Result<()> {
+        if self.prev_hash != prev_hash {
+            anyhow::bail!("header prev_hash mismatch");
+        }
+        if !self.meets_target() {
+            anyhow::bail!("header hash does not meet difficulty target");
+        }
+        Ok(())
+    }
+
     /// Check if header hash meets the difficulty target
     pub fn meets_target(&self) -> bool {
         let hash = self.hash();
