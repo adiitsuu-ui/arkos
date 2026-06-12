@@ -40,12 +40,17 @@ base64 = "0.22"           # Encoding for tokens
 rpassword = "7"           # Secure password prompt (no echo to terminal)
 bip39 = "2"               # BIP39 mnemonic phrase generation and recovery
 # --- Post-quantum layer ---
-pqcrypto-mldsa = "0.1.2"     # ML-DSA-65 (NIST FIPS 204) -- quantum-safe signatures (replaces pqcrypto-dilithium)
+pqcrypto-mldsa = "0.1.2"
+ml-dsa = { version = "0.1", features = ["rand_core", "zeroize"] }
+ml-kem = { version = "0.3", features = ["getrandom"] }  # ML-KEM-768 (NIST FIPS 203) -- quantum-safe P2P key exchange
+rand_chacha = "0.3"     # ML-DSA-65 (NIST FIPS 204) -- quantum-safe signatures (replaces pqcrypto-dilithium)
 pqcrypto-traits = "0.3"     # Traits for post-quantum crypto
 # --- Constant-time comparisons (prevents timing attacks on token auth) ---
 subtle = "2"
-# --- Noise Protocol (Noise_XX_25519_ChaChaPoly_BLAKE2s P2P transport encryption) ---
+# --- Noise Protocol + ML-KEM-768 hybrid P2P transport encryption ---
 snow = "0.9"
+chacha20poly1305 = "0.10"   # ChaCha20-Poly1305 AEAD for the post-quantum inner layer
+hkdf = "0.12"               # HKDF-SHA256 to derive PQ session key from ML-KEM shared secret
 # --- RPC / HTTP API layer ---
 axum = { version = "0.7", features = ["json"] }
 tower = "0.4"

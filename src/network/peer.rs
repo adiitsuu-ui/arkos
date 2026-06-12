@@ -1,13 +1,14 @@
-//! P2P peer connection with Noise_XX_25519_ChaChaPoly_BLAKE2s transport encryption.
+//! P2P peer connection with Noise_XX hybrid + ML-KEM-768 transport encryption.
 //!
 //! All P2P messages are:
 //!   1. Serialized as JSON
-//!   2. Encrypted + authenticated by the Noise transport
-//!   3. Framed with a 4-byte big-endian length prefix
+//!   2. Encrypted by the PQ layer (ChaCha20-Poly1305 keyed from ML-KEM-768)
+//!   3. Encrypted + authenticated by the Noise transport (X25519)
+//!   4. Framed with a 4-byte big-endian length prefix
 //!
-//! The Noise handshake runs immediately after the TCP connection is established.
-//! No application-level messages are exchanged until both sides have completed
-//! mutual authentication.
+//! The Noise_XX handshake runs immediately after TCP connection establishment,
+//! followed by the ML-KEM-768 ephemeral key exchange inside the Noise channel.
+//! No application-level messages are exchanged until both layers are complete.
 
 use crate::network::noise::{
     generate_keypair, NoiseConn, NoiseReader, NoiseWriter, NOISE_MAX_MESSAGE,
@@ -25,26 +26,23 @@ pub struct Peer {
 }
 
 impl Peer {
-    /// Connect to a remote peer and perform the Noise_XX initiator handshake.
+    /// Connect to a remote peer, perform Noise_XX + ML-KEM-768 hybrid handshake.
     pub async fn connect(addr: &str) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
-        let (mut reader, mut writer) = stream.into_split();
+        let (reader, writer) = stream.into_split();
         let keypair = generate_keypair()?;
-        let transport =
-            NoiseConn::connect(&mut reader, &mut writer, addr.to_string(), &keypair).await?;
-        let conn = NoiseConn::from_transport(reader, writer, transport, addr.to_string());
+        let conn = NoiseConn::connect(reader, writer, addr.to_string(), &keypair).await?;
         Ok(Peer {
             addr: addr.to_string(),
             conn,
         })
     }
 
-    /// Accept an inbound connection and perform the Noise_XX responder handshake.
+    /// Accept an inbound connection, perform Noise_XX + ML-KEM-768 hybrid handshake.
     pub async fn from_stream(stream: TcpStream, addr: String) -> Result<Self> {
-        let (mut reader, mut writer) = stream.into_split();
+        let (reader, writer) = stream.into_split();
         let keypair = generate_keypair()?;
-        let transport = NoiseConn::accept(&mut reader, &mut writer, &keypair).await?;
-        let conn = NoiseConn::from_transport(reader, writer, transport, addr.clone());
+        let conn = NoiseConn::accept(reader, writer, &keypair, addr.clone()).await?;
         Ok(Peer { addr, conn })
     }
 
