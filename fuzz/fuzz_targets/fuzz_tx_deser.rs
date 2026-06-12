@@ -6,8 +6,6 @@ use arkos::transaction::tx::Transaction;
 fuzz_target!(|data: &[u8]| {
     // Bincode path — used for block storage and hashing.
     if let Ok(tx) = bincode::deserialize::<Transaction>(data) {
-        // sig_hash exercises the full output serialization path including
-        // Script::to_bytes() and effective_script().
         let _ = tx.sig_hash(0x41524b4f); // "ARKO"
         let _ = tx.txid();
         let _ = tx.is_coinbase();

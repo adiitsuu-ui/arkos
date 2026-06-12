@@ -11,6 +11,16 @@ const MAX_BLOCK_SIZE: u64 = 32 * 1024 * 1024;
 /// Maximum allowed serialized size for a single transaction (4 MB).
 const MAX_TX_SIZE: u64 = 4 * 1024 * 1024;
 
+/// Canonical bincode options for all DB serialization.
+/// FixintEncoding + AllowTrailing ensures consistent round-trips:
+///   - FixintEncoding: fixed-width integers (no varint surprises across versions)
+///   - AllowTrailing: safe deserialization even if record has padding bytes
+fn db_opts() -> impl bincode::Options {
+    bincode::options()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+}
+
 pub struct BlockStore {
     db: DB,
 }
@@ -25,13 +35,8 @@ impl BlockStore {
 
     pub fn save_block(&self, block: &Block) -> Result<()> {
         let key = format!("block:{}", block.hash_hex());
-        // Use the same options as load_block_by_hash (FixintEncoding + AllowTrailing).
-        let val = bincode::options()
-            .with_fixint_encoding()
-            .allow_trailing_bytes()
-            .serialize(block)?;
+        let val = db_opts().serialize(block)?;
         self.db.put(key.as_bytes(), &val)?;
-        // Also index by height
         let height_key = format!("height:{}", block.height);
         self.db
             .put(height_key.as_bytes(), block.hash_hex().as_bytes())?;
@@ -42,11 +47,7 @@ impl BlockStore {
         let key = format!("block:{}", hash);
         match self.db.get(key.as_bytes())? {
             Some(val) => {
-                // Must match bincode::serialize(): FixintEncoding + AllowTrailing.
-                // bincode::options() defaults to VarintEncoding, which is incompatible.
-                let block = bincode::options()
-                    .with_fixint_encoding()
-                    .allow_trailing_bytes()
+                let block = db_opts()
                     .with_limit(MAX_BLOCK_SIZE)
                     .deserialize(&val)
                     .map_err(|e| anyhow::anyhow!("block deserialization failed: {}", e))?;
@@ -69,10 +70,7 @@ impl BlockStore {
 
     pub fn save_transaction(&self, tx: &Transaction) -> Result<()> {
         let key = format!("tx:{}", tx.txid_hex());
-        let val = bincode::options()
-            .with_fixint_encoding()
-            .allow_trailing_bytes()
-            .serialize(tx)?;
+        let val = db_opts().serialize(tx)?;
         self.db.put(key.as_bytes(), &val)?;
         Ok(())
     }
@@ -81,9 +79,7 @@ impl BlockStore {
         let key = format!("tx:{}", txid);
         match self.db.get(key.as_bytes())? {
             Some(val) => {
-                let tx = bincode::options()
-                    .with_fixint_encoding()
-                    .allow_trailing_bytes()
+                let tx = db_opts()
                     .with_limit(MAX_TX_SIZE)
                     .deserialize(&val)
                     .map_err(|e| anyhow::anyhow!("tx deserialization failed: {}", e))?;
