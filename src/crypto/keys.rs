@@ -41,16 +41,31 @@ impl KeyPair {
     }
 }
 
-/// Derive a 20-byte address from a compressed public key.
+/// Derive a 20-byte address from a compressed public key (ECDSA-only).
 ///
-/// Algorithm: SHA-256(SHA-256(pubkey))[..20]
-///
-/// Note: this is intentionally NOT Bitcoin's RIPEMD-160(SHA-256(pubkey)).
-/// Arkos uses a double-SHA-256 with 20-byte truncation. This is documented
-/// as the canonical Arkos address derivation algorithm.
+/// DEPRECATED: commits only to the ECDSA key. Use hybrid_pubkey_to_address
+/// for all new code so that addresses bind both ECDSA and ML-DSA keys.
 pub fn pubkey_to_address(pubkey: &PublicKey) -> Address {
     let sha = Sha256::digest(pubkey.serialize());
     let sha2 = Sha256::digest(&sha);
+    let mut addr = [0u8; 20];
+    addr.copy_from_slice(&sha2[..20]);
+    addr
+}
+
+/// Hybrid address: commits to BOTH the ECDSA and ML-DSA-65 public keys.
+///
+/// Algorithm: SHA256(SHA256(ecdsa_pk_compressed || ml_dsa_pk))[..20]
+///
+/// This prevents a quantum attacker who has broken secp256k1 ECDSA from
+/// substituting their own ML-DSA key and spending UTXOs. Both keys are bound
+/// at address creation time, so any substitution produces a different address.
+pub fn hybrid_pubkey_to_address(ecdsa_pk: &PublicKey, ml_dsa_pk: &[u8]) -> Address {
+    let mut preimage = Vec::with_capacity(33 + ml_dsa_pk.len());
+    preimage.extend_from_slice(&ecdsa_pk.serialize());
+    preimage.extend_from_slice(ml_dsa_pk);
+    let sha1 = Sha256::digest(&preimage);
+    let sha2 = Sha256::digest(&sha1);
     let mut addr = [0u8; 20];
     addr.copy_from_slice(&sha2[..20]);
     addr

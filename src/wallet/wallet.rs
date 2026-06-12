@@ -1,4 +1,4 @@
-use crate::crypto::keys::pubkey_to_address;
+use crate::crypto::keys::hybrid_pubkey_to_address;
 use crate::crypto::quantum::HybridKeyPair;
 use crate::transaction::tx::{Transaction, TxInput, TxOutput};
 use crate::transaction::utxo::UtxoSet;
@@ -34,7 +34,10 @@ impl Wallet {
     }
 
     pub fn address(&self) -> String {
-        hex::encode(pubkey_to_address(&self.keypair.ecdsa_public))
+        hex::encode(hybrid_pubkey_to_address(
+            &self.keypair.ecdsa_public,
+            &self.keypair.dilithium_public,
+        ))
     }
 
     pub fn public_key_hex(&self) -> String {

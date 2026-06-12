@@ -40,7 +40,7 @@ base64 = "0.22"           # Encoding for tokens
 rpassword = "7"           # Secure password prompt (no echo to terminal)
 bip39 = "2"               # BIP39 mnemonic phrase generation and recovery
 # --- Post-quantum layer ---
-pqcrypto-dilithium = "0.5"  # CRYSTALS-Dilithium (NIST FIPS 204 / ML-DSA) — quantum-safe signatures
+pqcrypto-mldsa = "0.1.2"     # ML-DSA-65 (NIST FIPS 204) -- quantum-safe signatures (replaces pqcrypto-dilithium)
 pqcrypto-traits = "0.3"     # Traits for post-quantum crypto
 # --- Constant-time comparisons (prevents timing attacks on token auth) ---
 subtle = "2"

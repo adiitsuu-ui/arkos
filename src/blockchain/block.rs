@@ -164,7 +164,22 @@ impl Block {
     }
 }
 
+/// Mainnet genesis difficulty: Bitcoin-genesis equivalent.
+/// Mining this takes real hardware time; set once before mainnet launch.
+pub const MAINNET_GENESIS_BITS: u32 = 0x1d00ffff;
+
+/// Regtest/testnet genesis difficulty: mines instantly for development and tests.
+pub const REGTEST_GENESIS_BITS: u32 = 0x207fffff;
+
 pub fn genesis_block() -> Block {
+    genesis_block_with_bits(REGTEST_GENESIS_BITS)
+}
+
+pub fn genesis_block_mainnet() -> Block {
+    genesis_block_with_bits(MAINNET_GENESIS_BITS)
+}
+
+pub fn genesis_block_with_bits(bits: u32) -> Block {
     use crate::transaction::tx::Transaction;
     let coinbase = Transaction::coinbase(
         "0000000000000000000000000000000000000000", // burn address for genesis
@@ -178,10 +193,9 @@ pub fn genesis_block() -> Block {
         prev_hash: "0000000000000000000000000000000000000000000000000000000000000000".into(),
         merkle_root: merkle,
         timestamp: 1_700_000_000,
-        bits: 0x1e0fffff, // easy initial difficulty
+        bits,
         nonce: 0,
     };
-    // Mine the genesis block
     mine_block_header(&mut header);
     Block {
         header,

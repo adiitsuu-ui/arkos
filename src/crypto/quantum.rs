@@ -1,27 +1,27 @@
-//! Hybrid post-quantum signature scheme: ECDSA (secp256k1) + CRYSTALS-Dilithium Level 3.
+//! Hybrid post-quantum signature scheme: ECDSA (secp256k1) + ML-DSA-65 (NIST FIPS 204).
 //!
 //! WHY HYBRID?
 //!   - If quantum computers break ECDSA → Dilithium still protects you
 //!   - If Dilithium has an undiscovered flaw → ECDSA still protects you
 //!   - Both must verify for a signature to be valid (belt AND suspenders)
 //!
-//! CRYSTALS-Dilithium (NIST FIPS 204 / ML-DSA):
+//! ML-DSA-65 (NIST FIPS 204 / CRYSTALS-Dilithium successor):
 //!   - Based on lattice problems (Module-LWE / Module-SIS)
 //!   - No known quantum algorithm can break it
-//!   - NIST selected it as the primary post-quantum signature standard (2024)
-//!   - Level 3 provides ~128-bit post-quantum security
+//!   - NIST selected it as the primary post-quantum digital signature standard (FIPS 204, 2024)
+//!   - Level 65 provides ~128-bit post-quantum security (equivalent to ML-DSA-65)
 //!
-//! KEY SIZES (Dilithium Level 3):
+//! KEY SIZES (ML-DSA-65):
 //!   Public key:  1,952 bytes
-//!   Secret key:  4,000 bytes
+//!   Secret key:  4,032 bytes
 //!   Signature:   3,293 bytes
 //!
 //! TOTAL HYBRID SIGNATURE:
-//!   ECDSA compact sig (64 bytes) + Dilithium sig (3,293 bytes) = 3,357 bytes
+//!   ECDSA compact sig (64 bytes) + ML-DSA-65 sig (3,293 bytes) = 3,357 bytes
 //!   This is larger than pure ECDSA but the quantum security is worth it.
 
 use anyhow::{bail, Result};
-use pqcrypto_dilithium::dilithium3;
+use pqcrypto_mldsa::mldsa65;
 use pqcrypto_traits::sign::{
     DetachedSignature, PublicKey as PqPublicKey, SecretKey as PqSecretKey,
 };
@@ -33,23 +33,23 @@ pub struct HybridKeyPair {
     // Classical (ECDSA secp256k1)
     pub ecdsa_secret: SecretKey,
     pub ecdsa_public: PublicKey,
-    // Post-quantum (Dilithium Level 3)
+    // Post-quantum (ML-DSA-65)
     pub dilithium_secret: Vec<u8>,
     pub dilithium_public: Vec<u8>,
 }
 
-/// A hybrid signature: both ECDSA and Dilithium signatures
+/// A hybrid signature: both ECDSA and ML-DSA-65 signatures
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridSignature {
     pub ecdsa_sig: Vec<u8>,     // 64 bytes (compact ECDSA)
-    pub dilithium_sig: Vec<u8>, // 3,293 bytes (Dilithium Level 3)
+    pub dilithium_sig: Vec<u8>, // 3,293 bytes (ML-DSA-65)
 }
 
 /// A hybrid public key for verification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HybridPublicKey {
     pub ecdsa_pubkey: Vec<u8>,     // 33 bytes (compressed secp256k1)
-    pub dilithium_pubkey: Vec<u8>, // 1,952 bytes (Dilithium Level 3)
+    pub dilithium_pubkey: Vec<u8>, // 1,952 bytes (ML-DSA-65)
 }
 
 impl HybridKeyPair {
@@ -60,7 +60,7 @@ impl HybridKeyPair {
         let (ecdsa_secret, ecdsa_public) = secp.generate_keypair(&mut rand::thread_rng());
 
         // Post-quantum Dilithium
-        let (pq_pk, pq_sk) = dilithium3::keypair();
+        let (pq_pk, pq_sk) = mldsa65::keypair();
         let dilithium_public = pq_pk.as_bytes().to_vec();
         let dilithium_secret = pq_sk.as_bytes().to_vec();
 
@@ -90,12 +90,12 @@ impl HybridKeyPair {
         let ecdsa_public = PublicKey::from_secret_key(&secp, &ecdsa_secret);
 
         // Validate the Dilithium secret key
-        dilithium3::SecretKey::from_bytes(dilithium_secret_bytes)
-            .map_err(|_| anyhow::anyhow!("invalid dilithium secret key"))?;
+        mldsa65::SecretKey::from_bytes(dilithium_secret_bytes)
+            .map_err(|_| anyhow::anyhow!("invalid ML-DSA-65 secret key"))?;
 
         // Validate the Dilithium public key
-        dilithium3::PublicKey::from_bytes(dilithium_public_bytes)
-            .map_err(|_| anyhow::anyhow!("invalid dilithium public key"))?;
+        mldsa65::PublicKey::from_bytes(dilithium_public_bytes)
+            .map_err(|_| anyhow::anyhow!("invalid ML-DSA-65 public key"))?;
 
         Ok(HybridKeyPair {
             ecdsa_secret,
@@ -112,7 +112,7 @@ impl HybridKeyPair {
         let secp = Secp256k1::new();
         let ecdsa_secret = SecretKey::from_slice(ecdsa_secret_bytes)?;
         let ecdsa_public = PublicKey::from_secret_key(&secp, &ecdsa_secret);
-        let (pq_pk, pq_sk) = dilithium3::keypair();
+        let (pq_pk, pq_sk) = mldsa65::keypair();
         Ok(HybridKeyPair {
             ecdsa_secret,
             ecdsa_public,
@@ -137,10 +137,10 @@ impl HybridKeyPair {
         let ecdsa_msg = secp256k1::Message::from_digest(msg_hash);
         let ecdsa_sig = secp.sign_ecdsa(&ecdsa_msg, &self.ecdsa_secret);
 
-        // 2. Dilithium signature (signs the raw message, not just the hash)
+        // 2. ML-DSA-65 signature (signs the raw message, not just the hash)
         let pq_sk =
-            dilithium3::SecretKey::from_bytes(&self.dilithium_secret).expect("valid dilithium sk");
-        let pq_sig = dilithium3::detached_sign(message, &pq_sk);
+            mldsa65::SecretKey::from_bytes(&self.dilithium_secret).expect("valid dilithium sk");
+        let pq_sig = mldsa65::detached_sign(message, &pq_sk);
 
         HybridSignature {
             ecdsa_sig: ecdsa_sig.serialize_compact().to_vec(),
@@ -208,12 +208,12 @@ impl HybridSignature {
             .map_err(|_| anyhow::anyhow!("ECDSA signature verification FAILED"))?;
 
         // 2. Verify Dilithium (post-quantum)
-        let pq_pk = dilithium3::PublicKey::from_bytes(&pubkey.dilithium_pubkey)
-            .map_err(|_| anyhow::anyhow!("invalid Dilithium public key"))?;
-        let pq_sig = dilithium3::DetachedSignature::from_bytes(&self.dilithium_sig)
-            .map_err(|_| anyhow::anyhow!("invalid Dilithium signature format"))?;
-        dilithium3::verify_detached_signature(&pq_sig, message, &pq_pk).map_err(|_| {
-            anyhow::anyhow!("DILITHIUM signature verification FAILED — possible quantum attack")
+        let pq_pk = mldsa65::PublicKey::from_bytes(&pubkey.dilithium_pubkey)
+            .map_err(|_| anyhow::anyhow!("invalid ML-DSA-65 public key"))?;
+        let pq_sig = mldsa65::DetachedSignature::from_bytes(&self.dilithium_sig)
+            .map_err(|_| anyhow::anyhow!("invalid ML-DSA-65 signature format"))?;
+        mldsa65::verify_detached_signature(&pq_sig, message, &pq_pk).map_err(|_| {
+            anyhow::anyhow!("ML-DSA-65 signature verification FAILED — possible quantum attack")
         })?;
 
         Ok(())
@@ -266,12 +266,12 @@ mod tests {
         let msg = b"steal all the coins";
         let sig = kp.sign(msg);
 
-        // Tamper: replace Dilithium sig with garbage (simulating broken Dilithium)
+        // Tamper: replace ML-DSA-65 sig with garbage (simulating broken Dilithium)
         let mut forged = sig.clone();
         forged.dilithium_sig = vec![0u8; forged.dilithium_sig.len()];
         assert!(
             forged.verify(msg, &kp.public_key()).is_err(),
-            "forged Dilithium sig must be rejected"
+            "forged ML-DSA-65 sig must be rejected"
         );
     }
 
@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(
             sig.dilithium_sig.len(),
             3309,
-            "Dilithium3 sig should be 3309 bytes"
+            "ML-DSA-65 sig should be 3309 bytes"
         );
         println!("Hybrid signature total size: {} bytes", sig.size());
         println!("  ECDSA:     {} bytes", sig.ecdsa_sig.len());

@@ -1,10 +1,11 @@
 use crate::blockchain::block::{
-    genesis_block, merkle_root, mine_block_header, Block, BlockHeader, MAX_SUPPLY_ARKES,
+    genesis_block, genesis_block_with_bits, merkle_root, mine_block_header, Block, BlockHeader,
+    MAINNET_GENESIS_BITS, MAX_SUPPLY_ARKES,
 };
 use crate::blockchain::consensus::{
     adjust_difficulty, validate_timestamp, DIFFICULTY_ADJUSTMENT_INTERVAL,
 };
-use crate::crypto::keys::pubkey_to_address;
+use crate::crypto::keys::hybrid_pubkey_to_address;
 use crate::storage::db::BlockStore;
 use crate::transaction::mempool::Mempool;
 use crate::transaction::tx::Transaction;
@@ -39,7 +40,16 @@ impl Blockchain {
         Self::from_genesis(genesis, None)
     }
 
+    pub fn new_for_network(network: &str) -> Self {
+        let bits = if network == "mainnet" { MAINNET_GENESIS_BITS } else { crate::blockchain::block::REGTEST_GENESIS_BITS };
+        Self::from_genesis(genesis_block_with_bits(bits), None)
+    }
+
     pub fn open(path: &str) -> Result<Self> {
+        Self::open_for_network(path, "regtest")
+    }
+
+    pub fn open_for_network(path: &str, network: &str) -> Result<Self> {
         let store = BlockStore::open(path)?;
         if let Some(tip_hash) = store.load_tip()? {
             let tip = store
@@ -55,7 +65,8 @@ impl Blockchain {
             return Self::from_blocks(blocks, Some(store));
         }
 
-        let chain = Self::from_genesis(genesis_block(), Some(store));
+        let bits = if network == "mainnet" { MAINNET_GENESIS_BITS } else { crate::blockchain::block::REGTEST_GENESIS_BITS };
+        let chain = Self::from_genesis(genesis_block_with_bits(bits), Some(store));
         if let Some(store) = &chain.store {
             store.save_block(chain.tip())?;
             store.save_tip(&chain.tip().hash_hex())?;
@@ -512,8 +523,8 @@ fn validate_tx_with_utxo(tx: &Transaction, utxo_set: &UtxoSet) -> Result<u64> {
                     e
                 )
             })?;
-        // Verify pubkey matches address
-        let derived_addr = hex::encode(pubkey_to_address(&pubkey));
+        // Verify pubkey matches address (both ECDSA + ML-DSA keys must match)
+        let derived_addr = hex::encode(hybrid_pubkey_to_address(&pubkey, &input.pubkey.dilithium_pubkey));
         if derived_addr != utxo.address {
             bail!("pubkey does not match UTXO address");
         }
