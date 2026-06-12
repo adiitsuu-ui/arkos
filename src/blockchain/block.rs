@@ -50,9 +50,27 @@ impl BlockHeader {
     /// Used during headers-first sync: validate PoW on all headers before
     /// committing resources to download full blocks.  This prevents a malicious
     /// peer from forcing us to download and fully validate large invalid blocks.
-    pub fn validate_header_only(&self, prev_hash: &str) -> anyhow::Result<()> {
+    /// Validate this header against a known parent hash and expected difficulty bits.
+    ///
+    /// `expected_bits` should come from the chain's `next_bits()` at the relevant height,
+    /// or from the previously validated header's bits when validating a consecutive chain.
+    /// Passing `None` skips the bits check (used only when the expected difficulty is not
+    /// yet known — e.g. during early peer message processing).
+    pub fn validate_header_only(
+        &self,
+        prev_hash: &str,
+        expected_bits: Option<u32>,
+    ) -> anyhow::Result<()> {
         if self.prev_hash != prev_hash {
             anyhow::bail!("header prev_hash mismatch");
+        }
+        if let Some(bits) = expected_bits {
+            if self.bits != bits {
+                anyhow::bail!(
+                    "header bits 0x{:08x} does not match expected 0x{:08x}",
+                    self.bits, bits
+                );
+            }
         }
         if !self.meets_target() {
             anyhow::bail!("header hash does not meet difficulty target");

@@ -382,8 +382,13 @@ async fn handle_peer(
                     // Chain linkage is already verified by `prev_matches` above.
                     // Call validate_header_only with the actual expected parent so the
                     // prev_hash check inside the function is meaningful, not tautological.
+                    // We pass None for expected_bits here: we don't know the exact
+                    // retarget height for an arbitrary peer's chain tip, so PoW
+                    // verification (self.meets_target()) still enforces the bits
+                    // field internally — a peer cannot inflate bits without
+                    // producing an astronomically hard PoW.
                     let expected_parent = prev.as_deref().unwrap_or(&header.prev_hash);
-                    if prev_matches && header.validate_header_only(expected_parent).is_ok() {
+                    if prev_matches && header.validate_header_only(expected_parent, None).is_ok() {
                         let hash = header.hash_hex();
                         let known = chain.lock().await.block_by_hash(&hash).is_some();
                         if !known {
