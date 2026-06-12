@@ -9,8 +9,15 @@ pub const MAX_MEMPOOL_BYTES: usize = 32 * 1024 * 1024; // 32 MB
 /// Prevents free DoS via fee-less spam transactions.
 pub const MIN_FEE_ARKES: u64 = 1_000; // 1,000 arkes ≈ 0.000001 ARKOS
 
+/// Minimum non-zero output value. Outputs below this are dust and rejected.
+/// Named after Bitcoin's analogous limit; value reflects the cost of spending
+/// a UTXO relative to the fees generated.
+pub const DUST_LIMIT_ARKES: u64 = 546;
+
 pub struct Mempool {
     txs: HashMap<String, Transaction>,
+    /// Fee in arkes for each transaction (txid → fee).
+    fees: HashMap<String, u64>,
     /// Total approximate serialized size of held transactions.
     total_bytes: usize,
 }
@@ -19,6 +26,7 @@ impl Mempool {
     pub fn new() -> Self {
         Mempool {
             txs: HashMap::new(),
+            fees: HashMap::new(),
             total_bytes: 0,
         }
     }
@@ -48,6 +56,7 @@ impl Mempool {
         let txid = tx.txid_hex();
         if self.txs.insert(txid.clone(), tx).is_none() {
             self.total_bytes += tx_size;
+            self.fees.insert(txid.clone(), fee);
         }
         Ok(txid)
     }
@@ -58,6 +67,7 @@ impl Mempool {
         let txid = tx.txid_hex();
         if self.txs.insert(txid.clone(), tx).is_none() {
             self.total_bytes += tx_size;
+            self.fees.insert(txid.clone(), 0);
         }
         txid
     }
@@ -66,6 +76,7 @@ impl Mempool {
         if let Some(tx) = self.txs.remove(txid) {
             let tx_size = bincode::serialized_size(&tx).unwrap_or(0) as usize;
             self.total_bytes = self.total_bytes.saturating_sub(tx_size);
+            self.fees.remove(txid);
         }
     }
 
@@ -73,15 +84,29 @@ impl Mempool {
         self.txs.get(txid)
     }
 
-    /// Return up to `limit` transactions in a **deterministic** order (sorted by txid).
+    pub fn fee_for(&self, txid: &str) -> u64 {
+        self.fees.get(txid).copied().unwrap_or(0)
+    }
+
+    /// Return up to `limit` transactions ordered by **fee rate** (arkes per byte)
+    /// descending — highest-value transactions are included first.
     ///
-    /// Non-deterministic ordering (HashMap iteration) would produce different
-    /// merkle roots on different nodes for the same mempool contents, making it
-    /// impossible for nodes to agree on the next block template and causing
-    /// constant spurious block rejections.
+    /// Ties are broken by txid for determinism.  Miners naturally favour this
+    /// ordering because it maximises fee income per block weight.
     pub fn take(&self, limit: usize) -> Vec<&Transaction> {
         let mut entries: Vec<(&String, &Transaction)> = self.txs.iter().collect();
-        entries.sort_unstable_by_key(|(txid, _)| txid.as_str());
+        entries.sort_unstable_by(|(txid_a, tx_a), (txid_b, tx_b)| {
+            let size_a = bincode::serialized_size(tx_a).unwrap_or(1).max(1);
+            let size_b = bincode::serialized_size(tx_b).unwrap_or(1).max(1);
+            let fee_a = self.fees.get(*txid_a).copied().unwrap_or(0);
+            let fee_b = self.fees.get(*txid_b).copied().unwrap_or(0);
+            // fee_rate_a = fee_a / size_a  — compare without floating point:
+            // fee_a * size_b vs fee_b * size_a
+            let lhs = fee_a.saturating_mul(size_b);
+            let rhs = fee_b.saturating_mul(size_a);
+            rhs.cmp(&lhs) // descending
+                .then_with(|| txid_a.cmp(txid_b)) // tie-break: ascending txid
+        });
         entries.into_iter().take(limit).map(|(_, tx)| tx).collect()
     }
 

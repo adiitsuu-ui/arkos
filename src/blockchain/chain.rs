@@ -24,6 +24,7 @@ const MAX_COINBASE_OUTPUTS: usize = 16;
 const FINALITY_DEPTH: u64 = 200;
 
 pub struct Blockchain {
+    pub network_magic: u32,
     pub blocks: Vec<Block>,
     pub block_index: HashMap<String, usize>, // hash -> height
     pub all_blocks: HashMap<String, Block>,
@@ -42,7 +43,8 @@ impl Blockchain {
 
     pub fn new_for_network(network: &str) -> Self {
         let bits = if network == "mainnet" { MAINNET_GENESIS_BITS } else { crate::blockchain::block::REGTEST_GENESIS_BITS };
-        Self::from_genesis(genesis_block_with_bits(bits), None)
+        let magic = crate::network::protocol::magic_for_network(network);
+        Self::from_genesis_with_magic(genesis_block_with_bits(bits), None, magic)
     }
 
     pub fn open(path: &str) -> Result<Self> {
@@ -62,7 +64,10 @@ impl Blockchain {
                 })?;
                 blocks.push(block);
             }
-            return Self::from_blocks(blocks, Some(store));
+            let magic = crate::network::protocol::magic_for_network(network);
+            let mut chain = Self::from_blocks(blocks, Some(store))?;
+            chain.network_magic = magic;
+            return Ok(chain);
         }
 
         let bits = if network == "mainnet" { MAINNET_GENESIS_BITS } else { crate::blockchain::block::REGTEST_GENESIS_BITS };
@@ -75,6 +80,10 @@ impl Blockchain {
     }
 
     fn from_genesis(genesis: Block, store: Option<BlockStore>) -> Self {
+        Self::from_genesis_with_magic(genesis, store, crate::network::protocol::REGTEST_MAGIC)
+    }
+
+    fn from_genesis_with_magic(genesis: Block, store: Option<BlockStore>, network_magic: u32) -> Self {
         let hash = genesis.hash_hex();
         info!("Genesis block: {}", hash);
 
@@ -92,6 +101,7 @@ impl Blockchain {
         chain_work.insert(hash, block_work(genesis.header.bits));
 
         Blockchain {
+            network_magic,
             blocks: vec![genesis],
             block_index,
             all_blocks,
@@ -228,9 +238,16 @@ impl Blockchain {
         let bits = self.next_bits();
         let reward = self.capped_block_reward(height);
 
-        let coinbase = Transaction::coinbase(miner_address, reward, height);
+        // Select up to 500 mempool txs by fee rate and sum their fees
+        let selected: Vec<Transaction> = self.mempool.take(500).into_iter().cloned().collect();
+        let total_fees: u64 = selected
+            .iter()
+            .map(|tx| self.mempool.fee_for(&tx.txid_hex()))
+            .fold(0u64, |acc, f| acc.saturating_add(f));
+
+        let coinbase = Transaction::coinbase(miner_address, reward.saturating_add(total_fees), height);
         let mut txs = vec![coinbase];
-        txs.extend(self.mempool.take(500).into_iter().cloned());
+        txs.extend(selected);
 
         let merkle = merkle_root(&txs);
         let mut header = BlockHeader {
@@ -270,7 +287,7 @@ impl Blockchain {
 
     /// Validate a transaction and return the fee (input_sum - output_sum).
     fn validate_tx(&self, tx: &Transaction) -> Result<u64> {
-        validate_tx_with_utxo(tx, &self.utxo_set)
+        validate_tx_with_utxo(tx, &self.utxo_set, self.network_magic, self.height())
     }
 
     fn validate_block_against_parent(&self, block: &Block, parent_hash: &str) -> Result<()> {
@@ -307,7 +324,7 @@ impl Blockchain {
 
         self.validate_coinbase_subsidy_with_state(block, total_minted, &branch_utxo)?;
         for tx in block.transactions.iter().skip(1) {
-            validate_tx_with_utxo(tx, &branch_utxo)?;
+            validate_tx_with_utxo(tx, &branch_utxo, self.network_magic, block.height)?;
             branch_utxo.apply_transaction(tx);
         }
         Ok(())
@@ -356,7 +373,7 @@ impl Blockchain {
         let mut total_fees: u64 = 0;
         for tx in block.transactions.iter().skip(1) {
             total_fees = total_fees
-                .checked_add(validate_tx_with_utxo(tx, utxo_set)?)
+                .checked_add(validate_tx_with_utxo(tx, utxo_set, self.network_magic, block.height)?)
                 .ok_or_else(|| anyhow::anyhow!("total fees overflow"))?;
         }
 
@@ -491,11 +508,20 @@ impl Default for Blockchain {
     }
 }
 
-fn validate_tx_with_utxo(tx: &Transaction, utxo_set: &UtxoSet) -> Result<u64> {
+fn validate_tx_with_utxo(tx: &Transaction, utxo_set: &UtxoSet, network_magic: u32, current_height: u64) -> Result<u64> {
     let mut input_sum: u64 = 0;
-    let sig_hash = tx.sig_hash();
+    let sig_hash = tx.sig_hash(network_magic);
 
     for input in &tx.inputs {
+        // Coinbase maturity check: coinbase outputs need COINBASE_MATURITY confirmations
+        if utxo_set.is_immature_coinbase(&input.prev_tx_hash, current_height) {
+            anyhow::bail!(
+                "coinbase output {}:{} has not matured (requires {} confirmations)",
+                input.prev_tx_hash,
+                input.prev_index,
+                crate::transaction::utxo::COINBASE_MATURITY
+            );
+        }
         let utxo = utxo_set
             .get(&input.prev_tx_hash, input.prev_index)
             .ok_or_else(|| {
@@ -527,6 +553,16 @@ fn validate_tx_with_utxo(tx: &Transaction, utxo_set: &UtxoSet) -> Result<u64> {
         let derived_addr = hex::encode(hybrid_pubkey_to_address(&pubkey, &input.pubkey.dilithium_pubkey));
         if derived_addr != utxo.address {
             bail!("pubkey does not match UTXO address");
+        }
+    }
+
+    for output in &tx.outputs {
+        if output.value < crate::transaction::mempool::DUST_LIMIT_ARKES {
+            bail!(
+                "output value {} arkes is below dust limit {} arkes",
+                output.value,
+                crate::transaction::mempool::DUST_LIMIT_ARKES
+            );
         }
     }
 
