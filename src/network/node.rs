@@ -1,11 +1,13 @@
 use crate::blockchain::chain::Blockchain;
 use crate::network::peer::Peer;
+use crate::network::peers::{PeerStore, MIN_OUTBOUND};
 use crate::network::protocol::{
     InvItem, InvKind, Message, MAX_GETDATA_INFLIGHT, MAX_HEADERS_PER_RESPONSE, PROTOCOL_VERSION,
 };
 use crate::security::rate_limit::NodeRateLimiter;
 use anyhow::Result;
 use log::{info, warn};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, Mutex};
@@ -24,6 +26,12 @@ const MAX_BLOCKS_PER_GETBLOCKS: usize = 500;
 /// Maximum number of ancestor hashes sent in a block locator.
 const MAX_LOCATOR_HASHES: usize = 32;
 
+/// How often (seconds) the feeler task probes a random idle known peer.
+const FEELER_INTERVAL_SECS: u64 = 120;
+
+/// How often (seconds) the outbound-maintenance task checks peer count.
+const OUTBOUND_CHECK_INTERVAL_SECS: u64 = 30;
+
 #[derive(Debug, Clone)]
 pub(crate) struct RelayMessage {
     pub(crate) source: String,
@@ -34,9 +42,10 @@ pub struct Node {
     pub chain: Arc<Mutex<Blockchain>>,
     pub listen_addr: String,
     pub network_magic: u32,
-    pub peers: Arc<Mutex<Vec<String>>>,
+    pub(crate) peer_store: Arc<Mutex<PeerStore>>,
     pub(crate) relay_tx: broadcast::Sender<RelayMessage>,
     rate_limiters: Arc<Mutex<NodeRateLimiter>>,
+    anchor_path: PathBuf,
 }
 
 impl Node {
@@ -46,13 +55,133 @@ impl Node {
             chain: Arc::new(Mutex::new(chain)),
             listen_addr,
             network_magic,
-            peers: Arc::new(Mutex::new(vec![])),
+            peer_store: Arc::new(Mutex::new(PeerStore::new())),
             relay_tx,
             rate_limiters: Arc::new(Mutex::new(NodeRateLimiter::new())),
+            anchor_path: PathBuf::from("anchors.txt"),
         }
     }
 
     pub async fn run(&self) -> Result<()> {
+        // Dial anchor peers from the previous run before accepting new connections.
+        let anchors = PeerStore::load_anchors(&self.anchor_path);
+        for addr in anchors {
+            info!("Dialing anchor peer {}", addr);
+            if let Err(e) = self.connect_to_peer(&addr).await {
+                warn!("Anchor peer {} unreachable: {}", addr, e);
+            }
+        }
+
+        // Background: feeler task — periodically probe a random idle known peer.
+        {
+            let peer_store = self.peer_store.clone();
+            let chain = self.chain.clone();
+            let network_magic = self.network_magic;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(FEELER_INTERVAL_SECS))
+                        .await;
+                    let target = peer_store.lock().await.random_unconnected();
+                    if let Some(addr) = target {
+                        info!("Feeler connecting to {}", addr);
+                        if let Ok(mut peer) = Peer::connect(&addr).await {
+                            let height = chain.lock().await.height();
+                            let _ = peer
+                                .send(&Message::Version {
+                                    version: PROTOCOL_VERSION,
+                                    network_magic,
+                                    best_height: height,
+                                    user_agent: "arkos/0.1-feeler".into(),
+                                })
+                                .await;
+                            info!("Feeler confirmed {} is reachable", addr);
+                        } else {
+                            peer_store.lock().await.remove_known(&addr);
+                            info!("Feeler evicted unreachable peer {}", addr);
+                        }
+                    }
+                }
+            });
+        }
+
+        // Background: outbound-maintenance task — keep at least MIN_OUTBOUND peers.
+        {
+            let peer_store = self.peer_store.clone();
+            let chain = self.chain.clone();
+            let relay_tx = self.relay_tx.clone();
+            let rate_limiters = self.rate_limiters.clone();
+            let network_magic = self.network_magic;
+            let anchor_path = self.anchor_path.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(
+                        OUTBOUND_CHECK_INTERVAL_SECS,
+                    ))
+                    .await;
+
+                    {
+                        let store = peer_store.lock().await;
+                        let _ = store.save_anchors(&anchor_path);
+                        if !store.needs_outbound() {
+                            continue;
+                        }
+                    }
+
+                    let candidates = peer_store.lock().await.outbound_candidates();
+                    if candidates.is_empty() {
+                        continue;
+                    }
+
+                    let deficit = {
+                        let store = peer_store.lock().await;
+                        MIN_OUTBOUND.saturating_sub(store.outbound_count())
+                    };
+
+                    use rand::seq::SliceRandom;
+                    let mut chosen = candidates;
+                    chosen.shuffle(&mut rand::thread_rng());
+
+                    for addr in chosen.into_iter().take(deficit) {
+                        info!("Outbound maintenance: dialing {}", addr);
+                        if let Ok(mut peer) = Peer::connect(&addr).await {
+                            let height = chain.lock().await.height();
+                            if peer
+                                .send(&Message::Version {
+                                    version: PROTOCOL_VERSION,
+                                    network_magic,
+                                    best_height: height,
+                                    user_agent: "arkos/0.1".into(),
+                                })
+                                .await
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            peer_store.lock().await.mark_outbound(&addr);
+                            let peer_store2 = peer_store.clone();
+                            let addr2 = addr.clone();
+                            let chain2 = chain.clone();
+                            let rl2 = rate_limiters.clone();
+                            let rtx2 = relay_tx.clone();
+                            let ap2 = anchor_path.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    handle_peer(peer, chain2, peer_store2.clone(), rl2, rtx2, network_magic)
+                                        .await
+                                {
+                                    warn!("Outbound peer {} error: {}", addr2, e);
+                                }
+                                let mut store = peer_store2.lock().await;
+                                store.unmark_outbound(&addr2);
+                                let _ = store.save_anchors(&ap2);
+                                info!("Outbound peer {} disconnected", addr2);
+                            });
+                        }
+                    }
+                }
+            });
+        }
+
         let listener = TcpListener::bind(&self.listen_addr).await?;
         info!("Node listening on {}", self.listen_addr);
 
@@ -64,10 +193,6 @@ impl Node {
                 warn!("Rate-limited new connection from {}", addr_str);
                 continue;
             }
-            // Perform Noise_XX handshake; drop connection if it fails.
-            // P2P authentication uses transport-layer mutual auth (Noise_XX),
-            // not application-level AccessTokens.  The AccessToken system is
-            // for RPC API permissioning only.
             let mut peer = match Peer::from_stream(stream, addr_str.clone()).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -75,10 +200,6 @@ impl Node {
                     continue;
                 }
             };
-            // Announce our height to the connecting peer so they know whether
-            // to request headers from us.  Both sides must send Version; the
-            // initiator sends first, the acceptor sends immediately after the
-            // Noise handshake completes.
             let our_height = self.chain.lock().await.height();
             if peer
                 .send(&Message::Version {
@@ -94,21 +215,21 @@ impl Node {
                 continue;
             }
             {
-                let mut known = self.peers.lock().await;
-                if !known.contains(&addr_str) && known.len() < MAX_KNOWN_PEERS {
-                    known.push(addr_str.clone());
-                }
+                let mut store = self.peer_store.lock().await;
+                store.add_known(&addr_str);
+                store.mark_inbound(&addr_str);
             }
             let chain = self.chain.clone();
-            let peers = self.peers.clone();
+            let peer_store = self.peer_store.clone();
             let relay_tx = self.relay_tx.clone();
             let rate_limiters = self.rate_limiters.clone();
             let network_magic = self.network_magic;
+            let anchor_path = self.anchor_path.clone();
             tokio::spawn(async move {
                 if let Err(e) = handle_peer(
                     peer,
                     chain,
-                    peers.clone(),
+                    peer_store.clone(),
                     rate_limiters,
                     relay_tx,
                     network_magic,
@@ -117,17 +238,17 @@ impl Node {
                 {
                     warn!("Peer {} error: {}", addr_str, e);
                 }
-                // Remove peer from known list on disconnect (M-5)
-                peers.lock().await.retain(|p| p != &addr_str);
+                {
+                    let mut store = peer_store.lock().await;
+                    store.unmark_inbound(&addr_str);
+                    let _ = store.save_anchors(&anchor_path);
+                }
                 info!("Peer {} disconnected", addr_str);
             });
         }
     }
 
     /// Mine one block locally and relay the inventory announcement to all peers.
-    ///
-    /// Runs the ArkHash miner in `spawn_blocking` to avoid stalling the async
-    /// runtime during the CPU-intensive PoW search.
     pub async fn mine_block_and_relay(&self, miner_address: &str) -> Result<()> {
         let chain_arc = self.chain.clone();
         let miner_address = miner_address.to_string();
@@ -166,18 +287,25 @@ impl Node {
             user_agent: "arkos/0.1".into(),
         })
         .await?;
+
+        {
+            let mut store = self.peer_store.lock().await;
+            store.add_known(addr);
+            store.mark_outbound(addr);
+        }
+
         let chain = self.chain.clone();
-        let peers = self.peers.clone();
+        let peer_store = self.peer_store.clone();
         let relay_tx = self.relay_tx.clone();
         let rate_limiters = self.rate_limiters.clone();
         let network_magic = self.network_magic;
         let addr_owned = addr.to_string();
-        let addr_for_push = addr_owned.clone();
+        let anchor_path = self.anchor_path.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_peer(
                 peer,
                 chain,
-                peers.clone(),
+                peer_store.clone(),
                 rate_limiters,
                 relay_tx,
                 network_magic,
@@ -186,24 +314,17 @@ impl Node {
             {
                 warn!("Peer {} error: {}", addr_owned, e);
             }
-            // Remove peer from known list on disconnect (M-5)
-            peers.lock().await.retain(|p| p != &addr_owned);
+            {
+                let mut store = peer_store.lock().await;
+                store.unmark_outbound(&addr_owned);
+                let _ = store.save_anchors(&anchor_path);
+            }
             info!("Peer {} disconnected", addr_owned);
         });
-        {
-            let mut known = self.peers.lock().await;
-            if !known.contains(&addr_for_push) && known.len() < MAX_KNOWN_PEERS {
-                known.push(addr_for_push);
-            }
-        }
         Ok(())
     }
 }
 
-/// Validate a peer address string before accepting it.
-///
-/// Accepts only valid `SocketAddr` strings (`ip:port` or `[ipv6]:port`).
-/// Rejects garbage strings that merely contain a colon.
 fn is_valid_peer_addr(addr: &str) -> bool {
     addr.parse::<std::net::SocketAddr>().is_ok()
 }
@@ -239,7 +360,7 @@ fn block_locator(chain: &Blockchain) -> Vec<String> {
 async fn handle_peer(
     peer: Peer,
     chain: Arc<Mutex<Blockchain>>,
-    peers: Arc<Mutex<Vec<String>>>,
+    peer_store: Arc<Mutex<PeerStore>>,
     rate_limiters: Arc<Mutex<NodeRateLimiter>>,
     relay_tx: broadcast::Sender<RelayMessage>,
     expected_network_magic: u32,
@@ -247,11 +368,6 @@ async fn handle_peer(
     let addr = peer.addr.clone();
     let mut relay_rx = relay_tx.subscribe();
 
-    // Split the peer into independent read/write halves, then move the read
-    // half to a dedicated task.  This prevents the select! cancellation-safety
-    // hazard: when the relay branch wins, a bare `peer.recv()` future is
-    // dropped mid-`read_exact`, leaving the Noise frame stream misaligned and
-    // causing the "noise message too large" error on the next read.
     let (mut peer_reader, mut peer_writer) = peer.into_split();
     let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Result<Message>>(128);
     tokio::spawn(async move {
@@ -259,7 +375,7 @@ async fn handle_peer(
             let res = peer_reader.recv().await;
             let is_err = res.is_err();
             if in_tx.send(res).await.is_err() {
-                break; // main task has exited
+                break;
             }
             if is_err {
                 break;
@@ -297,7 +413,6 @@ async fn handle_peer(
                 best_height,
                 user_agent,
             } => {
-                // H-6: reject oversized user_agent strings
                 if user_agent.len() > MAX_USER_AGENT_LEN {
                     anyhow::bail!(
                         "peer {} sent user_agent of {} bytes (max {})",
@@ -327,9 +442,6 @@ async fn handle_peer(
                 peer_writer.send(&Message::Verack).await?;
                 let our_height = chain.lock().await.height();
                 if best_height > our_height {
-                    // Headers-first: request headers before full blocks.
-                    // We validate PoW on the lighter header objects first, only
-                    // downloading full blocks for headers that pass validation.
                     let locator = {
                         let chain = chain.lock().await;
                         block_locator(&chain)
@@ -364,9 +476,6 @@ async fn handle_peer(
             }
 
             Message::Headers { headers } => {
-                // Validate PoW on each header before committing to download the
-                // full blocks.  Invalid headers are dropped silently; we still
-                // request the valid ones so one bad apple does not stall sync.
                 let mut prev: Option<String> = None;
                 let mut to_fetch: Vec<InvItem> = Vec::new();
                 for header in headers {
@@ -379,14 +488,6 @@ async fn handle_peer(
                         .map(|prev_hash| header.prev_hash == *prev_hash)
                         .unwrap_or(parent_known);
 
-                    // Chain linkage is already verified by `prev_matches` above.
-                    // Call validate_header_only with the actual expected parent so the
-                    // prev_hash check inside the function is meaningful, not tautological.
-                    // We pass None for expected_bits here: we don't know the exact
-                    // retarget height for an arbitrary peer's chain tip, so PoW
-                    // verification (self.meets_target()) still enforces the bits
-                    // field internally — a peer cannot inflate bits without
-                    // producing an astronomically hard PoW.
                     let expected_parent = prev.as_deref().unwrap_or(&header.prev_hash);
                     if prev_matches && header.validate_header_only(expected_parent, None).is_ok() {
                         let hash = header.hash_hex();
@@ -407,8 +508,6 @@ async fn handle_peer(
                     }
                 }
 
-                // Request full blocks in batches of MAX_GETDATA_INFLIGHT to
-                // cap memory usage during initial sync.
                 for chunk in to_fetch.chunks(MAX_GETDATA_INFLIGHT) {
                     peer_writer
                         .send(&Message::GetData {
@@ -419,20 +518,15 @@ async fn handle_peer(
             }
 
             Message::GetBlocks { locator_hashes } => {
-                // L-3: per-peer bandwidth quota — each response ships up to 500
-                // block hashes; without a dedicated limit a peer could drive
-                // 50 k announcements/min at the general message rate.
                 if !rate_limiters.lock().await.getblocks.check(&addr) {
                     anyhow::bail!("peer {} exceeded GetBlocks rate limit", addr);
                 }
                 let chain = chain.lock().await;
-                // L-6: use block_index (main chain only), not all_blocks
                 let start = locator_hashes
                     .iter()
                     .find_map(|h| chain.block_index.get(h).copied())
                     .map(|height| height + 1)
                     .unwrap_or(0);
-                // L-3: cap response volume
                 let items: Vec<InvItem> = chain
                     .blocks
                     .iter()
@@ -448,6 +542,7 @@ async fn handle_peer(
                     peer_writer.send(&Message::Inv { items }).await?;
                 }
             }
+
             Message::Inv { items } => {
                 let chain = chain.lock().await;
                 let needed: Vec<InvItem> = items
@@ -466,10 +561,8 @@ async fn handle_peer(
                         .await?;
                 }
             }
+
             Message::GetData { items } => {
-                // Collect all responses while holding the lock once, then send
-                // them all after releasing it.  Separating lock from send avoids
-                // holding the chain lock across async I/O.
                 let responses: Vec<Message> = {
                     let chain = chain.lock().await;
                     items
@@ -489,6 +582,7 @@ async fn handle_peer(
                     peer_writer.send(&msg).await?;
                 }
             }
+
             Message::BlockMsg(block) => {
                 if !rate_limiters.lock().await.blocks.check(&addr) {
                     anyhow::bail!("peer {} exceeded block rate limit", addr);
@@ -511,6 +605,7 @@ async fn handle_peer(
                     Err(e) => warn!("Rejected block: {}", e),
                 }
             }
+
             Message::TxMsg(tx) => {
                 if !rate_limiters.lock().await.transactions.check(&addr) {
                     anyhow::bail!("peer {} exceeded transaction rate limit", addr);
@@ -533,12 +628,13 @@ async fn handle_peer(
                     Err(e) => warn!("Rejected tx: {}", e),
                 }
             }
+
             Message::Ping(nonce) => {
                 peer_writer.send(&Message::Pong(nonce)).await?;
             }
             Message::Pong(_) => {}
+
             Message::Addr { addrs } => {
-                // H-3: cap entries per message and validate each address
                 if addrs.len() > MAX_ADDR_PER_MESSAGE {
                     anyhow::bail!(
                         "peer {} sent Addr with {} entries (max {})",
@@ -547,20 +643,26 @@ async fn handle_peer(
                         MAX_ADDR_PER_MESSAGE
                     );
                 }
-                let mut known = peers.lock().await;
+                let mut store = peer_store.lock().await;
+                let mut added = 0usize;
                 for candidate in addrs {
                     if !is_valid_peer_addr(&candidate) {
                         warn!("Peer {} sent invalid address: {:?}", addr, candidate);
                         continue;
                     }
-                    if known.len() >= MAX_KNOWN_PEERS {
+                    if store.known_count() >= MAX_KNOWN_PEERS {
                         break;
                     }
-                    if !known.contains(&candidate) {
-                        known.push(candidate);
+                    if store.add_known(&candidate) {
+                        added += 1;
                     }
                 }
-                info!("Known peers: {}", known.len());
+                info!(
+                    "Known peers: {} (+{} from {})",
+                    store.known_count(),
+                    added,
+                    addr
+                );
             }
         }
     }
