@@ -122,17 +122,31 @@ impl MasterKey {
 }
 
 impl AccessToken {
-    /// The canonical bytes that get signed (everything except the signature field)
+    /// The canonical bytes that get signed (everything except the signature field).
+    ///
+    /// Each variable-length field is prefixed with its byte length as a `u64 LE`
+    /// to prevent type-confusion collisions (e.g. `"alicefoo"+"bar"` vs
+    /// `"alice"+"foobar"` producing the same byte string without framing).
     fn signable_bytes(&self) -> Vec<u8> {
         let mut data = Vec::new();
-        data.extend_from_slice(self.holder_name.as_bytes());
-        data.extend_from_slice(self.holder_pubkey.as_bytes());
+
+        let write_bytes = |buf: &mut Vec<u8>, field: &[u8]| {
+            buf.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            buf.extend_from_slice(field);
+        };
+
+        write_bytes(&mut data, self.holder_name.as_bytes());
+        write_bytes(&mut data, self.holder_pubkey.as_bytes());
+
+        // Encode permission count, then each permission string with its own length prefix.
+        data.extend_from_slice(&(self.permissions.len() as u64).to_le_bytes());
         for p in &self.permissions {
-            data.extend_from_slice(format!("{:?}", p).as_bytes());
+            write_bytes(&mut data, format!("{:?}", p).as_bytes());
         }
+
         data.extend_from_slice(&self.issued_at.to_le_bytes());
         data.extend_from_slice(&self.expires_at.to_le_bytes());
-        data.extend_from_slice(self.token_id.as_bytes());
+        write_bytes(&mut data, self.token_id.as_bytes());
         data
     }
 

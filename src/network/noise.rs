@@ -17,10 +17,10 @@
 
 use anyhow::{bail, Result};
 use snow::{Builder, HandshakeState, TransportState};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex as TokioMutex;
-use std::sync::Arc;
 
 /// Noise_XX pattern descriptor
 const NOISE_PATTERN: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
@@ -43,12 +43,30 @@ pub struct NoiseConn {
     transport: Arc<TokioMutex<TransportState>>,
 }
 
+/// Read-only half of a split `NoiseConn`.
+///
+/// Obtained via [`NoiseConn::into_split`].  Owns the TCP read half and a shared
+/// reference to the Noise transport state.  Read and write operations use
+/// separate Noise nonces so holding the transport mutex independently is safe.
+pub struct NoiseReader {
+    reader: OwnedReadHalf,
+    transport: Arc<TokioMutex<TransportState>>,
+}
+
+/// Write-only half of a split `NoiseConn`.
+///
+/// Obtained via [`NoiseConn::into_split`].
+pub struct NoiseWriter {
+    writer: OwnedWriteHalf,
+    transport: Arc<TokioMutex<TransportState>>,
+}
+
 impl NoiseConn {
     /// Perform the Noise_XX initiator handshake and return the encrypted connection.
     pub async fn connect(
         reader: &mut OwnedReadHalf,
         writer: &mut OwnedWriteHalf,
-        addr: String,
+        _addr: String,
         local_keypair: &snow::Keypair,
     ) -> Result<TransportState> {
         let builder = Builder::new(NOISE_PATTERN.parse()?)
@@ -82,6 +100,26 @@ impl NoiseConn {
             writer,
             transport: Arc::new(TokioMutex::new(transport)),
         }
+    }
+
+    /// Split this connection into independent read and write halves.
+    ///
+    /// After splitting, the caller is responsible for ensuring that neither
+    /// half outlives the underlying TCP connection.  The Noise transport state
+    /// is shared via `Arc<Mutex<...>>`; read and write use separate nonces so
+    /// concurrent use of the two halves is safe.
+    pub fn into_split(self) -> (NoiseReader, NoiseWriter) {
+        let transport = self.transport;
+        (
+            NoiseReader {
+                reader: self.reader,
+                transport: transport.clone(),
+            },
+            NoiseWriter {
+                writer: self.writer,
+                transport,
+            },
+        )
     }
 
     /// Send a plaintext message, encrypting it with Noise transport.
@@ -158,6 +196,47 @@ async fn handshake(
     }
 
     Ok(state.into_transport_mode()?)
+}
+
+impl NoiseReader {
+    /// Receive and decrypt the next Noise transport frame.
+    pub async fn recv_raw(&mut self) -> Result<Vec<u8>> {
+        let mut len_buf = [0u8; 4];
+        self.reader.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > NOISE_MAX_MESSAGE {
+            bail!("noise message too large: {} bytes", len);
+        }
+        let mut ciphertext = vec![0u8; len];
+        self.reader.read_exact(&mut ciphertext).await?;
+        let mut plaintext = vec![0u8; len];
+        let n = {
+            let mut transport = self.transport.lock().await;
+            transport.read_message(&ciphertext, &mut plaintext)?
+        };
+        plaintext.truncate(n);
+        Ok(plaintext)
+    }
+}
+
+impl NoiseWriter {
+    /// Encrypt and send `plaintext`.  Splits automatically at NOISE_MAX_PLAINTEXT.
+    pub async fn send_raw(&mut self, plaintext: &[u8]) -> Result<()> {
+        let mut buf = vec![0u8; NOISE_MAX_PLAINTEXT + 16];
+        let mut offset = 0;
+        while offset < plaintext.len() {
+            let end = (offset + NOISE_MAX_PLAINTEXT).min(plaintext.len());
+            let chunk = &plaintext[offset..end];
+            let n = {
+                let mut transport = self.transport.lock().await;
+                transport.write_message(chunk, &mut buf)?
+            };
+            self.writer.write_all(&(n as u32).to_be_bytes()).await?;
+            self.writer.write_all(&buf[..n]).await?;
+            offset = end;
+        }
+        Ok(())
+    }
 }
 
 /// Generate a new X25519 static keypair for use with the Noise protocol.

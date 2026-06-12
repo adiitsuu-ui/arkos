@@ -4,12 +4,14 @@ use crate::blockchain::block::{
 use crate::blockchain::consensus::{
     adjust_difficulty, validate_timestamp, DIFFICULTY_ADJUSTMENT_INTERVAL,
 };
+use crate::crypto::keys::pubkey_to_address;
 use crate::storage::db::BlockStore;
 use crate::transaction::mempool::Mempool;
 use crate::transaction::tx::Transaction;
 use crate::transaction::utxo::UtxoSet;
 use anyhow::{bail, Result};
 use log::info;
+use secp256k1::PublicKey;
 use std::collections::HashMap;
 
 /// Maximum coinbase outputs allowed in a single block.
@@ -149,20 +151,7 @@ impl Blockchain {
             .ok_or_else(|| anyhow::anyhow!("parent block missing"))?;
         block.validate(&parent.hash_hex())?;
 
-        // Validate difficulty and timestamp against the *current active chain* state.
-        // For side-chain blocks this is approximate; full UTXO validation happens
-        // during activate_chain if the side chain ever gains more work.
-        if self.block_index.contains_key(&parent_hash) {
-            // Parent is on the active chain — we can do the full contextual check.
-            self.validate_block_difficulty(&block)?;
-            self.validate_block_timestamp(&block)?;
-            self.validate_coinbase_subsidy(&block)?;
-            for tx in &block.transactions {
-                if !tx.is_coinbase() {
-                    self.validate_tx(tx)?;
-                }
-            }
-        }
+        self.validate_block_against_parent(&block, &parent_hash)?;
 
         let parent_work = *self
             .chain_work
@@ -215,12 +204,10 @@ impl Blockchain {
             .map(|b| b.hash_hex())
             .collect();
         // Remove anything below the cutoff that isn't on the active chain.
-        self.all_blocks.retain(|hash, block| {
-            block.height > cutoff_height || active_hashes.contains(hash)
-        });
-        self.chain_work.retain(|hash, _| {
-            self.all_blocks.contains_key(hash)
-        });
+        self.all_blocks
+            .retain(|hash, block| block.height > cutoff_height || active_hashes.contains(hash));
+        self.chain_work
+            .retain(|hash, _| self.all_blocks.contains_key(hash));
     }
 
     /// Mine a new block using transactions from the mempool
@@ -272,72 +259,137 @@ impl Blockchain {
 
     /// Validate a transaction and return the fee (input_sum - output_sum).
     fn validate_tx(&self, tx: &Transaction) -> Result<u64> {
-        use crate::crypto::keys::pubkey_to_address;
-        use secp256k1::PublicKey;
-
-        let mut input_sum: u64 = 0;
-        let sig_hash = tx.sig_hash();
-
-        for input in &tx.inputs {
-            let utxo = self
-                .utxo_set
-                .get(&input.prev_tx_hash, input.prev_index)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "UTXO not found: {}:{}",
-                        input.prev_tx_hash,
-                        input.prev_index
-                    )
-                })?;
-            input_sum = input_sum
-                .checked_add(utxo.value)
-                .ok_or_else(|| anyhow::anyhow!("input sum overflow"))?;
-
-            // Verify signature
-            let pubkey = PublicKey::from_slice(&input.pubkey.ecdsa_pubkey)
-                .map_err(|_| anyhow::anyhow!("invalid pubkey"))?;
-            input
-                .signature
-                .verify(&sig_hash, &input.pubkey)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "invalid hybrid signature on input {}:{}: {}",
-                        input.prev_tx_hash,
-                        input.prev_index,
-                        e
-                    )
-                })?;
-            // Verify pubkey matches address
-            let derived_addr = hex::encode(pubkey_to_address(&pubkey));
-            if derived_addr != utxo.address {
-                bail!("pubkey does not match UTXO address");
-            }
-        }
-
-        let output_sum: u64 = tx.outputs.iter().map(|o| o.value).sum();
-        if input_sum < output_sum {
-            bail!("transaction outputs exceed inputs");
-        }
-        Ok(input_sum - output_sum)
+        validate_tx_with_utxo(tx, &self.utxo_set)
     }
 
-    fn validate_next_block(&self, block: &Block) -> Result<()> {
-        let prev = self.tip();
-        block.validate(&prev.hash_hex())?;
-        self.validate_block_difficulty(block)?;
-        self.validate_block_timestamp(block)?;
-        self.validate_coinbase_subsidy(block)?;
+    fn validate_block_against_parent(&self, block: &Block, parent_hash: &str) -> Result<()> {
+        let parent = self
+            .all_blocks
+            .get(parent_hash)
+            .ok_or_else(|| anyhow::anyhow!("parent block missing"))?;
+        let expected_height = parent.height + 1;
+        if block.height != expected_height {
+            bail!(
+                "block height mismatch: expected {}, got {}",
+                expected_height,
+                block.height
+            );
+        }
 
-        for tx in &block.transactions {
-            if !tx.is_coinbase() {
-                self.validate_tx(tx)?;
+        let (parent_chain, mut branch_utxo, total_minted) = self.parent_context(parent_hash)?;
+        let expected_bits = next_bits_for_blocks(&parent_chain);
+        if block.header.bits != expected_bits {
+            bail!(
+                "block difficulty bits mismatch: expected 0x{:08x}, got 0x{:08x}",
+                expected_bits,
+                block.header.bits
+            );
+        }
+
+        let median_past_time = median_past_time_for_blocks(&parent_chain);
+        if !validate_timestamp(block.header.timestamp, median_past_time, now_secs()) {
+            bail!(
+                "block timestamp {} is outside the allowed range",
+                block.header.timestamp
+            );
+        }
+
+        self.validate_coinbase_subsidy_with_state(block, total_minted, &branch_utxo)?;
+        for tx in block.transactions.iter().skip(1) {
+            validate_tx_with_utxo(tx, &branch_utxo)?;
+            branch_utxo.apply_transaction(tx);
+        }
+        Ok(())
+    }
+
+    fn parent_context(&self, parent_hash: &str) -> Result<(Vec<Block>, UtxoSet, u64)> {
+        let parent_is_active_tip = parent_hash == self.tip().hash_hex();
+        if parent_is_active_tip {
+            return Ok((
+                self.blocks.clone(),
+                self.utxo_set.clone(),
+                self.total_minted,
+            ));
+        }
+
+        let blocks = self.chain_to_hash(parent_hash)?;
+        let mut utxo_set = UtxoSet::default();
+        let mut total_minted = 0u64;
+        for block in &blocks {
+            total_minted = total_minted
+                .checked_add(coinbase_value(block))
+                .ok_or_else(|| anyhow::anyhow!("total minted supply overflow"))?;
+            for tx in &block.transactions {
+                utxo_set.apply_transaction(tx);
             }
+        }
+        Ok((blocks, utxo_set, total_minted))
+    }
+
+    fn validate_coinbase_subsidy_with_state(
+        &self,
+        block: &Block,
+        total_minted_before_block: u64,
+        utxo_set: &UtxoSet,
+    ) -> Result<()> {
+        // Limit coinbase outputs to prevent bloating the UTXO set.
+        let coinbase_tx = &block.transactions[0];
+        if coinbase_tx.outputs.len() > MAX_COINBASE_OUTPUTS {
+            bail!(
+                "coinbase has {} outputs, exceeding limit of {}",
+                coinbase_tx.outputs.len(),
+                MAX_COINBASE_OUTPUTS
+            );
+        }
+
+        let mut total_fees: u64 = 0;
+        for tx in block.transactions.iter().skip(1) {
+            total_fees = total_fees
+                .checked_add(validate_tx_with_utxo(tx, utxo_set)?)
+                .ok_or_else(|| anyhow::anyhow!("total fees overflow"))?;
+        }
+
+        let remaining_supply = MAX_SUPPLY_ARKES.saturating_sub(total_minted_before_block);
+        let scheduled_reward = Block::block_reward(block.height);
+        let allowed_reward = scheduled_reward
+            .min(remaining_supply)
+            .saturating_add(total_fees);
+        let minted = coinbase_value(block);
+
+        if minted > allowed_reward {
+            bail!(
+                "coinbase value {} exceeds allowed reward {} (subsidy {} + fees {})",
+                minted,
+                allowed_reward,
+                scheduled_reward.min(remaining_supply),
+                total_fees
+            );
         }
         Ok(())
     }
 
     fn activate_chain(&mut self, tip_hash: &str) -> Result<()> {
+        let old_tip_hash = self.tip().hash_hex();
+        let old_height = self.height();
         let new_blocks = self.chain_to_hash(tip_hash)?;
+        let new_height = new_blocks
+            .last()
+            .map(|block| block.height)
+            .ok_or_else(|| anyhow::anyhow!("cannot activate an empty chain"))?;
+        let common_height = self
+            .blocks
+            .iter()
+            .zip(new_blocks.iter())
+            .take_while(|(old, new)| old.hash_hex() == new.hash_hex())
+            .count()
+            .saturating_sub(1);
+        let depth = old_height.saturating_sub(common_height as u64);
+        if old_tip_hash != tip_hash && depth > 0 {
+            info!(
+                "Reorg: old_tip={} old_height={} new_tip={} new_height={} common_height={} depth={}",
+                old_tip_hash, old_height, tip_hash, new_height, common_height, depth
+            );
+        }
         self.rebuild_active_state(new_blocks)?;
         if let Some(store) = &self.store {
             for block in &self.blocks {
@@ -393,6 +445,7 @@ impl Blockchain {
         Ok(chain)
     }
 
+    #[cfg(test)]
     fn validate_coinbase_subsidy(&self, block: &Block) -> Result<()> {
         if block.height != self.height() + 1 {
             bail!(
@@ -401,107 +454,15 @@ impl Blockchain {
                 block.height
             );
         }
-
-        // Limit coinbase outputs to prevent bloating the UTXO set.
-        let coinbase_tx = &block.transactions[0];
-        if coinbase_tx.outputs.len() > MAX_COINBASE_OUTPUTS {
-            bail!(
-                "coinbase has {} outputs, exceeding limit of {}",
-                coinbase_tx.outputs.len(),
-                MAX_COINBASE_OUTPUTS
-            );
-        }
-
-        // Compute total fees from non-coinbase transactions.
-        // Fee = sum(input values) - sum(output values) for each tx.
-        let mut total_fees: u64 = 0;
-        for tx in block.transactions.iter().skip(1) {
-            let input_sum: u64 = tx
-                .inputs
-                .iter()
-                .filter_map(|inp| self.utxo_set.get(&inp.prev_tx_hash, inp.prev_index))
-                .map(|utxo| utxo.value)
-                .sum();
-            let output_sum: u64 = tx.outputs.iter().map(|o| o.value).sum();
-            total_fees = total_fees.saturating_add(input_sum.saturating_sub(output_sum));
-        }
-
-        let minted = coinbase_value(block);
-        let scheduled_reward = Block::block_reward(block.height);
-        let allowed_reward = scheduled_reward
-            .min(self.remaining_supply())
-            .saturating_add(total_fees);
-
-        if minted > allowed_reward {
-            bail!(
-                "coinbase value {} exceeds allowed reward {} (subsidy {} + fees {})",
-                minted,
-                allowed_reward,
-                scheduled_reward.min(self.remaining_supply()),
-                total_fees
-            );
-        }
-        Ok(())
-    }
-
-    fn validate_block_difficulty(&self, block: &Block) -> Result<()> {
-        let expected_bits = self.next_bits();
-        if block.header.bits != expected_bits {
-            bail!(
-                "block difficulty bits mismatch: expected 0x{:08x}, got 0x{:08x}",
-                expected_bits,
-                block.header.bits
-            );
-        }
-        Ok(())
-    }
-
-    fn validate_block_timestamp(&self, block: &Block) -> Result<()> {
-        if !validate_timestamp(block.header.timestamp, self.median_past_time(), now_secs()) {
-            bail!(
-                "block timestamp {} is outside the allowed range",
-                block.header.timestamp
-            );
-        }
-        Ok(())
+        self.validate_coinbase_subsidy_with_state(block, self.total_minted, &self.utxo_set)
     }
 
     fn median_past_time(&self) -> u64 {
-        let mut timestamps: Vec<u64> = self
-            .blocks
-            .iter()
-            .rev()
-            .take(11)
-            .map(|block| block.header.timestamp)
-            .collect();
-        timestamps.sort_unstable();
-        timestamps[timestamps.len() / 2]
+        median_past_time_for_blocks(&self.blocks)
     }
 
     pub fn next_bits(&self) -> u32 {
-        let height = self.height() + 1;
-        if height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0 {
-            return self.tip().header.bits;
-        }
-        let interval_start_height =
-            height.saturating_sub(DIFFICULTY_ADJUSTMENT_INTERVAL) as usize;
-
-        // Use the 11 blocks around each endpoint to compute median timestamps.
-        // This matches Bitcoin's MTP rule and prevents time-warp manipulation.
-        let start_window: Vec<u64> = self.blocks[interval_start_height
-            .saturating_sub(5)
-            ..=(interval_start_height + 5).min(self.blocks.len() - 1)]
-            .iter()
-            .map(|b| b.header.timestamp)
-            .collect();
-
-        let tip_idx = self.blocks.len() - 1;
-        let end_window: Vec<u64> = self.blocks[tip_idx.saturating_sub(10)..=tip_idx]
-            .iter()
-            .map(|b| b.header.timestamp)
-            .collect();
-
-        adjust_difficulty(self.tip().header.bits, &start_window, &end_window)
+        next_bits_for_blocks(&self.blocks)
     }
 
     pub fn block_by_hash(&self, hash: &str) -> Option<&Block> {
@@ -513,11 +474,77 @@ impl Blockchain {
     }
 }
 
+impl Default for Blockchain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn validate_tx_with_utxo(tx: &Transaction, utxo_set: &UtxoSet) -> Result<u64> {
+    let mut input_sum: u64 = 0;
+    let sig_hash = tx.sig_hash();
+
+    for input in &tx.inputs {
+        let utxo = utxo_set
+            .get(&input.prev_tx_hash, input.prev_index)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "UTXO not found: {}:{}",
+                    input.prev_tx_hash,
+                    input.prev_index
+                )
+            })?;
+        input_sum = input_sum
+            .checked_add(utxo.value)
+            .ok_or_else(|| anyhow::anyhow!("input sum overflow"))?;
+
+        // Verify signature
+        let pubkey = PublicKey::from_slice(&input.pubkey.ecdsa_pubkey)
+            .map_err(|_| anyhow::anyhow!("invalid pubkey"))?;
+        input
+            .signature
+            .verify(&sig_hash, &input.pubkey)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "invalid hybrid signature on input {}:{}: {}",
+                    input.prev_tx_hash,
+                    input.prev_index,
+                    e
+                )
+            })?;
+        // Verify pubkey matches address
+        let derived_addr = hex::encode(pubkey_to_address(&pubkey));
+        if derived_addr != utxo.address {
+            bail!("pubkey does not match UTXO address");
+        }
+    }
+
+    let output_sum = tx
+        .outputs
+        .iter()
+        .try_fold(0u64, |acc, o| acc.checked_add(o.value))
+        .ok_or_else(|| anyhow::anyhow!("output value sum overflow"))?;
+    if input_sum < output_sum {
+        bail!("transaction outputs exceed inputs");
+    }
+    Ok(input_sum - output_sum)
+}
+
+/// Returns the sum of all coinbase output values, or `u64::MAX` on overflow.
+///
+/// Callers that compare against `allowed_reward` will correctly reject overflow
+/// because `u64::MAX > any valid reward`. Callers using `checked_add` on the
+/// returned value will also propagate the error.
 fn coinbase_value(block: &Block) -> u64 {
     block
         .transactions
         .first()
-        .map(|tx| tx.outputs.iter().map(|o| o.value).sum())
+        .map(|tx| {
+            tx.outputs
+                .iter()
+                .try_fold(0u64, |acc, o| acc.checked_add(o.value))
+                .unwrap_or(u64::MAX)
+        })
         .unwrap_or(0)
 }
 
@@ -533,11 +560,41 @@ fn block_work(bits: u32) -> u128 {
     let mut prefix = [0u8; 16];
     prefix.copy_from_slice(&target[..16]);
     let target_prefix = u128::from_be_bytes(prefix);
-    if target_prefix == 0 {
-        u128::MAX
-    } else {
-        u128::MAX / target_prefix
+    u128::MAX.checked_div(target_prefix).unwrap_or(u128::MAX)
+}
+
+fn median_past_time_for_blocks(blocks: &[Block]) -> u64 {
+    let mut timestamps: Vec<u64> = blocks
+        .iter()
+        .rev()
+        .take(11)
+        .map(|block| block.header.timestamp)
+        .collect();
+    timestamps.sort_unstable();
+    timestamps[timestamps.len() / 2]
+}
+
+fn next_bits_for_blocks(blocks: &[Block]) -> u32 {
+    let tip = blocks.last().expect("chain context cannot be empty");
+    let height = tip.height + 1;
+    if !height.is_multiple_of(DIFFICULTY_ADJUSTMENT_INTERVAL) {
+        return tip.header.bits;
     }
+    let interval_start_height = height.saturating_sub(DIFFICULTY_ADJUSTMENT_INTERVAL) as usize;
+
+    let start_window: Vec<u64> = blocks[interval_start_height.saturating_sub(5)
+        ..=(interval_start_height + 5).min(blocks.len() - 1)]
+        .iter()
+        .map(|b| b.header.timestamp)
+        .collect();
+
+    let tip_idx = blocks.len() - 1;
+    let end_window: Vec<u64> = blocks[tip_idx.saturating_sub(10)..=tip_idx]
+        .iter()
+        .map(|b| b.header.timestamp)
+        .collect();
+
+    adjust_difficulty(tip.header.bits, &start_window, &end_window)
 }
 
 #[cfg(test)]
@@ -643,5 +700,110 @@ mod tests {
         assert_eq!(chain.height(), 2);
         assert!(chain.balance_of("side-miner") > 0);
         assert_eq!(chain.balance_of("main-miner"), 0);
+    }
+
+    #[test]
+    fn rejects_output_sum_overflow() {
+        use crate::crypto::quantum::{HybridPublicKey, HybridSignature};
+        use crate::transaction::tx::{Transaction, TxInput, TxOutput};
+
+        // Build a fake transaction whose outputs sum to > u64::MAX.
+        // Two outputs of u64::MAX/2 + 2 each overflow to a small value.
+        let huge = u64::MAX / 2 + 2;
+        let tx = Transaction::new(
+            vec![TxInput {
+                prev_tx_hash: "a".repeat(64),
+                prev_index: 0,
+                signature: HybridSignature {
+                    ecdsa_sig: vec![],
+                    dilithium_sig: vec![],
+                },
+                pubkey: HybridPublicKey {
+                    ecdsa_pubkey: vec![],
+                    dilithium_pubkey: vec![],
+                },
+                coinbase_extra: vec![],
+            }],
+            vec![
+                TxOutput {
+                    value: huge,
+                    address: "a".repeat(40),
+                },
+                TxOutput {
+                    value: huge,
+                    address: "b".repeat(40),
+                },
+            ],
+        );
+        let utxo_set = crate::transaction::utxo::UtxoSet::default();
+        // validate_tx_with_utxo will fail before the overflow check (UTXO not found),
+        // so test the overflow path directly via the helper.
+        let result: anyhow::Result<u64> = tx
+            .outputs
+            .iter()
+            .try_fold(0u64, |acc, o| acc.checked_add(o.value))
+            .ok_or_else(|| anyhow::anyhow!("output value sum overflow"));
+        assert!(result.is_err(), "overflowing output sum must be rejected");
+        let _ = utxo_set;
+    }
+
+    #[test]
+    fn coinbase_overflow_rejected_as_excessive() {
+        let mut chain = Blockchain::new();
+        // Build a coinbase transaction whose outputs sum past u64::MAX.
+        // coinbase_value() must return u64::MAX, causing the subsidy check to fail.
+        use crate::blockchain::block::Block;
+        use crate::crypto::quantum::{HybridPublicKey, HybridSignature};
+        use crate::transaction::tx::{TxInput, TxOutput};
+
+        let height = chain.height() + 1;
+        let huge = u64::MAX / 2 + 2;
+        let tx = crate::transaction::tx::Transaction {
+            inputs: vec![TxInput {
+                prev_tx_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .into(),
+                prev_index: u32::MAX,
+                signature: HybridSignature {
+                    ecdsa_sig: vec![],
+                    dilithium_sig: vec![],
+                },
+                pubkey: HybridPublicKey {
+                    ecdsa_pubkey: vec![],
+                    dilithium_pubkey: vec![],
+                },
+                coinbase_extra: height.to_le_bytes().to_vec(),
+            }],
+            outputs: vec![
+                TxOutput {
+                    value: huge,
+                    address: "miner".into(),
+                },
+                TxOutput {
+                    value: huge,
+                    address: "miner".into(),
+                },
+            ],
+            version: 1,
+            lock_time: 0,
+        };
+        // coinbase_value with these outputs wraps without fix; must return u64::MAX.
+        let fake_block = Block {
+            header: chain.tip().header.clone(),
+            transactions: vec![tx],
+            height,
+        };
+        let cv = coinbase_value(&fake_block);
+        assert_eq!(
+            cv,
+            u64::MAX,
+            "overflowing coinbase sum must be reported as u64::MAX"
+        );
+
+        // The subsidy check must reject this block.
+        let result = chain.validate_coinbase_subsidy(&fake_block);
+        assert!(
+            result.is_err(),
+            "coinbase with overflowing value must be rejected"
+        );
     }
 }

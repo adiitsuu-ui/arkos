@@ -1,6 +1,8 @@
 use crate::blockchain::chain::Blockchain;
 use crate::network::peer::Peer;
-use crate::network::protocol::{InvItem, InvKind, Message, PROTOCOL_VERSION};
+use crate::network::protocol::{
+    InvItem, InvKind, Message, MAX_GETDATA_INFLIGHT, MAX_HEADERS_PER_RESPONSE, PROTOCOL_VERSION,
+};
 use crate::security::rate_limit::NodeRateLimiter;
 use anyhow::Result;
 use log::{info, warn};
@@ -19,11 +21,13 @@ const MAX_USER_AGENT_LEN: usize = 256;
 
 /// Maximum number of blocks announced per `GetBlocks` response.
 const MAX_BLOCKS_PER_GETBLOCKS: usize = 500;
+/// Maximum number of ancestor hashes sent in a block locator.
+const MAX_LOCATOR_HASHES: usize = 32;
 
 #[derive(Debug, Clone)]
-struct RelayMessage {
-    source: String,
-    message: Message,
+pub(crate) struct RelayMessage {
+    pub(crate) source: String,
+    pub(crate) message: Message,
 }
 
 pub struct Node {
@@ -31,7 +35,7 @@ pub struct Node {
     pub listen_addr: String,
     pub network_magic: u32,
     pub peers: Arc<Mutex<Vec<String>>>,
-    relay_tx: broadcast::Sender<RelayMessage>,
+    pub(crate) relay_tx: broadcast::Sender<RelayMessage>,
     rate_limiters: Arc<Mutex<NodeRateLimiter>>,
 }
 
@@ -64,13 +68,31 @@ impl Node {
             // P2P authentication uses transport-layer mutual auth (Noise_XX),
             // not application-level AccessTokens.  The AccessToken system is
             // for RPC API permissioning only.
-            let peer = match Peer::from_stream(stream, addr_str.clone()).await {
+            let mut peer = match Peer::from_stream(stream, addr_str.clone()).await {
                 Ok(p) => p,
                 Err(e) => {
                     warn!("Noise handshake failed for {}: {}", addr_str, e);
                     continue;
                 }
             };
+            // Announce our height to the connecting peer so they know whether
+            // to request headers from us.  Both sides must send Version; the
+            // initiator sends first, the acceptor sends immediately after the
+            // Noise handshake completes.
+            let our_height = self.chain.lock().await.height();
+            if peer
+                .send(&Message::Version {
+                    version: PROTOCOL_VERSION,
+                    network_magic: self.network_magic,
+                    best_height: our_height,
+                    user_agent: "arkos/0.1".into(),
+                })
+                .await
+                .is_err()
+            {
+                warn!("Failed to send Version to {}", addr_str);
+                continue;
+            }
             {
                 let mut known = self.peers.lock().await;
                 if !known.contains(&addr_str) && known.len() < MAX_KNOWN_PEERS {
@@ -83,9 +105,15 @@ impl Node {
             let rate_limiters = self.rate_limiters.clone();
             let network_magic = self.network_magic;
             tokio::spawn(async move {
-                if let Err(e) =
-                    handle_peer(peer, chain, peers.clone(), rate_limiters, relay_tx, network_magic)
-                        .await
+                if let Err(e) = handle_peer(
+                    peer,
+                    chain,
+                    peers.clone(),
+                    rate_limiters,
+                    relay_tx,
+                    network_magic,
+                )
+                .await
                 {
                     warn!("Peer {} error: {}", addr_str, e);
                 }
@@ -94,6 +122,38 @@ impl Node {
                 info!("Peer {} disconnected", addr_str);
             });
         }
+    }
+
+    /// Mine one block locally and relay the inventory announcement to all peers.
+    ///
+    /// Runs the ArkHash miner in `spawn_blocking` to avoid stalling the async
+    /// runtime during the CPU-intensive PoW search.
+    pub async fn mine_block_and_relay(&self, miner_address: &str) -> Result<()> {
+        let chain_arc = self.chain.clone();
+        let miner_address = miner_address.to_string();
+        let relay_tx = self.relay_tx.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let handle = tokio::runtime::Handle::current();
+            handle.block_on(async {
+                let mut chain = chain_arc.lock().await;
+                let block = chain.mine_block(&miner_address);
+                let hash = block.hash_hex();
+                chain.add_block(block)?;
+                let _ = relay_tx.send(RelayMessage {
+                    source: String::new(),
+                    message: Message::Inv {
+                        items: vec![InvItem {
+                            kind: InvKind::Block,
+                            hash,
+                        }],
+                    },
+                });
+                anyhow::Ok(())
+            })
+        })
+        .await??;
+        Ok(())
     }
 
     pub async fn connect_to_peer(&self, addr: &str) -> Result<()> {
@@ -114,9 +174,15 @@ impl Node {
         let addr_owned = addr.to_string();
         let addr_for_push = addr_owned.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_peer(peer, chain, peers.clone(), rate_limiters, relay_tx, network_magic)
-                    .await
+            if let Err(e) = handle_peer(
+                peer,
+                chain,
+                peers.clone(),
+                rate_limiters,
+                relay_tx,
+                network_magic,
+            )
+            .await
             {
                 warn!("Peer {} error: {}", addr_owned, e);
             }
@@ -135,12 +201,43 @@ impl Node {
 }
 
 /// Validate a peer address string before accepting it.
+///
+/// Accepts only valid `SocketAddr` strings (`ip:port` or `[ipv6]:port`).
+/// Rejects garbage strings that merely contain a colon.
 fn is_valid_peer_addr(addr: &str) -> bool {
-    !addr.is_empty() && addr.len() <= 64 && addr.contains(':')
+    addr.parse::<std::net::SocketAddr>().is_ok()
+}
+
+fn block_locator(chain: &Blockchain) -> Vec<String> {
+    let mut locator = Vec::new();
+    let mut height = chain.height();
+    let mut step = 1u64;
+
+    loop {
+        if let Some(block) = chain.blocks.get(height as usize) {
+            locator.push(block.hash_hex());
+        }
+        if height == 0 || locator.len() >= MAX_LOCATOR_HASHES {
+            break;
+        }
+        height = height.saturating_sub(step);
+        if locator.len() > 10 {
+            step = step.saturating_mul(2);
+        }
+    }
+
+    if !locator
+        .last()
+        .map(|hash| chain.blocks[0].hash_hex() == *hash)
+        .unwrap_or(false)
+    {
+        locator.push(chain.blocks[0].hash_hex());
+    }
+    locator
 }
 
 async fn handle_peer(
-    mut peer: Peer,
+    peer: Peer,
     chain: Arc<Mutex<Blockchain>>,
     peers: Arc<Mutex<Vec<String>>>,
     rate_limiters: Arc<Mutex<NodeRateLimiter>>,
@@ -150,14 +247,38 @@ async fn handle_peer(
     let addr = peer.addr.clone();
     let mut relay_rx = relay_tx.subscribe();
 
+    // Split the peer into independent read/write halves, then move the read
+    // half to a dedicated task.  This prevents the select! cancellation-safety
+    // hazard: when the relay branch wins, a bare `peer.recv()` future is
+    // dropped mid-`read_exact`, leaving the Noise frame stream misaligned and
+    // causing the "noise message too large" error on the next read.
+    let (mut peer_reader, mut peer_writer) = peer.into_split();
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Result<Message>>(128);
+    tokio::spawn(async move {
+        loop {
+            let res = peer_reader.recv().await;
+            let is_err = res.is_err();
+            if in_tx.send(res).await.is_err() {
+                break; // main task has exited
+            }
+            if is_err {
+                break;
+            }
+        }
+    });
+
     loop {
         let msg = tokio::select! {
-            incoming = peer.recv() => incoming?,
+            incoming = in_rx.recv() => match incoming {
+                Some(Ok(msg)) => msg,
+                Some(Err(e)) => return Err(e),
+                None => break,
+            },
             relay = relay_rx.recv() => {
                 match relay {
                     Ok(relay) => {
                         if relay.source != addr {
-                            peer.send(&relay.message).await?;
+                            peer_writer.send(&relay.message).await?;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -199,18 +320,99 @@ async fn handle_peer(
                         version
                     );
                 }
-                info!("Peer {} is at height {} ({})", addr, best_height, user_agent);
-                peer.send(&Message::Verack).await?;
+                info!(
+                    "Peer {} is at height {} ({})",
+                    addr, best_height, user_agent
+                );
+                peer_writer.send(&Message::Verack).await?;
                 let our_height = chain.lock().await.height();
                 if best_height > our_height {
-                    let locator = chain.lock().await.tip().hash_hex();
-                    peer.send(&Message::GetBlocks {
-                        locator_hashes: vec![locator],
-                    })
-                    .await?;
+                    // Headers-first: request headers before full blocks.
+                    // We validate PoW on the lighter header objects first, only
+                    // downloading full blocks for headers that pass validation.
+                    let locator = {
+                        let chain = chain.lock().await;
+                        block_locator(&chain)
+                    };
+                    peer_writer
+                        .send(&Message::GetHeaders {
+                            locator_hashes: locator,
+                        })
+                        .await?;
                 }
             }
             Message::Verack => {}
+
+            Message::GetHeaders { locator_hashes } => {
+                let chain = chain.lock().await;
+                let start = locator_hashes
+                    .iter()
+                    .find_map(|h| chain.block_index.get(h).copied())
+                    .map(|height| height + 1)
+                    .unwrap_or(0);
+                let headers: Vec<_> = chain
+                    .blocks
+                    .iter()
+                    .skip(start)
+                    .take(MAX_HEADERS_PER_RESPONSE)
+                    .map(|b| b.header.clone())
+                    .collect();
+                drop(chain);
+                if !headers.is_empty() {
+                    peer_writer.send(&Message::Headers { headers }).await?;
+                }
+            }
+
+            Message::Headers { headers } => {
+                // Validate PoW on each header before committing to download the
+                // full blocks.  Invalid headers are dropped silently; we still
+                // request the valid ones so one bad apple does not stall sync.
+                let mut prev: Option<String> = None;
+                let mut to_fetch: Vec<InvItem> = Vec::new();
+                for header in headers {
+                    let parent_known = {
+                        let chain = chain.lock().await;
+                        chain.block_by_hash(&header.prev_hash).is_some()
+                    };
+                    let prev_matches = prev
+                        .as_ref()
+                        .map(|prev_hash| header.prev_hash == *prev_hash)
+                        .unwrap_or(parent_known);
+
+                    // Chain linkage is already verified by `prev_matches` above.
+                    // Call validate_header_only with the actual expected parent so the
+                    // prev_hash check inside the function is meaningful, not tautological.
+                    let expected_parent = prev.as_deref().unwrap_or(&header.prev_hash);
+                    if prev_matches && header.validate_header_only(expected_parent).is_ok() {
+                        let hash = header.hash_hex();
+                        let known = chain.lock().await.block_by_hash(&hash).is_some();
+                        if !known {
+                            to_fetch.push(InvItem {
+                                kind: InvKind::Block,
+                                hash: hash.clone(),
+                            });
+                        }
+                        prev = Some(hash);
+                    } else {
+                        warn!(
+                            "Peer {} sent invalid or disconnected header — stopping headers-first batch",
+                            addr
+                        );
+                        break;
+                    }
+                }
+
+                // Request full blocks in batches of MAX_GETDATA_INFLIGHT to
+                // cap memory usage during initial sync.
+                for chunk in to_fetch.chunks(MAX_GETDATA_INFLIGHT) {
+                    peer_writer
+                        .send(&Message::GetData {
+                            items: chunk.to_vec(),
+                        })
+                        .await?;
+                }
+            }
+
             Message::GetBlocks { locator_hashes } => {
                 // L-3: per-peer bandwidth quota — each response ships up to 500
                 // block hashes; without a dedicated limit a peer could drive
@@ -238,7 +440,7 @@ async fn handle_peer(
                     .collect();
                 drop(chain);
                 if !items.is_empty() {
-                    peer.send(&Message::Inv { items }).await?;
+                    peer_writer.send(&Message::Inv { items }).await?;
                 }
             }
             Message::Inv { items } => {
@@ -254,30 +456,32 @@ async fn handle_peer(
                     .collect();
                 drop(chain);
                 if !needed.is_empty() {
-                    peer.send(&Message::GetData { items: needed }).await?;
+                    peer_writer
+                        .send(&Message::GetData { items: needed })
+                        .await?;
                 }
             }
             Message::GetData { items } => {
-                let chain = chain.lock().await;
-                for item in items {
-                    match item.kind {
-                        InvKind::Block => {
-                            if let Some(block) = chain.block_by_hash(&item.hash) {
-                                let block = block.clone();
-                                drop(chain);
-                                peer.send(&Message::BlockMsg(block)).await?;
-                                break;
-                            }
-                        }
-                        InvKind::Transaction => {
-                            if let Some(tx) = chain.mempool.get(&item.hash) {
-                                let tx = tx.clone();
-                                drop(chain);
-                                peer.send(&Message::TxMsg(tx)).await?;
-                                break;
-                            }
-                        }
-                    }
+                // Collect all responses while holding the lock once, then send
+                // them all after releasing it.  Separating lock from send avoids
+                // holding the chain lock across async I/O.
+                let responses: Vec<Message> = {
+                    let chain = chain.lock().await;
+                    items
+                        .iter()
+                        .filter_map(|item| match item.kind {
+                            InvKind::Block => chain
+                                .block_by_hash(&item.hash)
+                                .map(|b| Message::BlockMsg(b.clone())),
+                            InvKind::Transaction => chain
+                                .mempool
+                                .get(&item.hash)
+                                .map(|tx| Message::TxMsg(tx.clone())),
+                        })
+                        .collect()
+                };
+                for msg in responses {
+                    peer_writer.send(&msg).await?;
                 }
             }
             Message::BlockMsg(block) => {
@@ -325,7 +529,7 @@ async fn handle_peer(
                 }
             }
             Message::Ping(nonce) => {
-                peer.send(&Message::Pong(nonce)).await?;
+                peer_writer.send(&Message::Pong(nonce)).await?;
             }
             Message::Pong(_) => {}
             Message::Addr { addrs } => {

@@ -20,13 +20,7 @@ sealed class MiningCommand {
 
 class StartMining extends MiningCommand {
   final BlockTemplate template;
-  final String deviceId;
-  final String deviceSignatureHex;
-  const StartMining({
-    required this.template,
-    required this.deviceId,
-    required this.deviceSignatureHex,
-  });
+  const StartMining({required this.template});
 }
 
 class StopMining extends MiningCommand {
@@ -35,8 +29,7 @@ class StopMining extends MiningCommand {
 
 class NewTemplate extends MiningCommand {
   final BlockTemplate template;
-  final String deviceSignatureHex;
-  const NewTemplate({required this.template, required this.deviceSignatureHex});
+  const NewTemplate({required this.template});
 }
 
 /// Sent from the mining isolate → main isolate with progress/results.
@@ -75,16 +68,12 @@ class _IsolateParams {
   final SendPort toMain;
   final ReceivePort fromMain;
   final BlockTemplate initialTemplate;
-  final String deviceId;
-  final String deviceSignatureHex;
   final int chunkSize; // nonces per FFI call
 
   _IsolateParams({
     required this.toMain,
     required this.fromMain,
     required this.initialTemplate,
-    required this.deviceId,
-    required this.deviceSignatureHex,
     required this.chunkSize,
   });
 }
@@ -92,7 +81,6 @@ class _IsolateParams {
 void _miningIsolateEntry(_IsolateParams params) {
   final native = ArkosNative.instance;
   var template = params.initialTemplate;
-  var deviceSignatureHex = params.deviceSignatureHex;
   var startNonce = 0;
   var totalHashes = 0;
   var lastHashrateTs = DateTime.now();
@@ -111,7 +99,6 @@ void _miningIsolateEntry(_IsolateParams params) {
       stopFlagPtr.value = 1;
       // Will be cleared and template replaced at the top of the loop.
       template = msg.template;
-      deviceSignatureHex = msg.deviceSignatureHex;
       startNonce = 0;
     }
   });
@@ -172,7 +159,7 @@ void _miningIsolateEntry(_IsolateParams params) {
 
 // ─── MiningService ────────────────────────────────────────────────────────────
 
-/// Orchestrates on-device mining across the FFI isolate and the node RPC.
+/// Orchestrates proof-of-work mining across the FFI isolate and the node RPC.
 ///
 /// Usage:
 /// ```dart
@@ -217,19 +204,35 @@ class MiningService extends ChangeNotifier {
 
   bool get isRunning => _isolate != null;
 
-  /// Start mining. [deviceId] and a function to obtain device signatures are required.
+  /// True when the native ArkHash library is available on this platform.
   ///
-  /// [getDeviceSignature] is called once per template to sign the mining_commitment
-  /// using the device TEE key (via the platform channel in DeviceService).
-  Future<void> start({
-    required String deviceId,
-    required Future<String> Function(String commitment) getDeviceSignature,
-  }) async {
+  /// On platforms where the native library cannot be loaded (e.g. web), this
+  /// returns false and [start] will throw a user-visible error instead of
+  /// crashing the app.
+  static bool get nativeMiningAvailable {
+    try {
+      ArkosNative.instance; // triggers lazy load; throws UnsupportedError on web
+      return true;
+    } on UnsupportedError {
+      return false;
+    }
+  }
+
+  /// Start mining against the node's standard proof-of-work template.
+  Future<void> start() async {
     if (isRunning) return;
+
+    if (!nativeMiningAvailable) {
+      _stats = _stats.copyWith(isActive: false);
+      _emit();
+      throw UnsupportedError(
+        'Native mining is not available on this platform. '
+        'Connect to a node via RPC for balance and chain queries.',
+      );
+    }
 
     // Fetch initial block template
     final template = await rpcClient.getBlockTemplate(walletAddress);
-    final sig = await getDeviceSignature(template.miningCommitment);
 
     _stats = MiningStats.zero.copyWith(
       isActive: true,
@@ -244,8 +247,6 @@ class MiningService extends ChangeNotifier {
       toMain: _fromIsolate.sendPort,
       fromMain: toIsolateSend,
       initialTemplate: template,
-      deviceId: deviceId,
-      deviceSignatureHex: sig,
       chunkSize: _chunkSize,
     );
 
@@ -256,16 +257,10 @@ class MiningService extends ChangeNotifier {
     _toIsolate = toIsolateSend.sendPort;
 
     // Listen for events from the isolate
-    _fromIsolate.listen(_handleIsolateEvent(
-      deviceId: deviceId,
-      getDeviceSignature: getDeviceSignature,
-    ));
+    _fromIsolate.listen(_handleIsolateEvent());
   }
 
-  void Function(dynamic) _handleIsolateEvent({
-    required String deviceId,
-    required Future<String> Function(String) getDeviceSignature,
-  }) {
+  void Function(dynamic) _handleIsolateEvent() {
     return (event) async {
       if (event is HashRateUpdate) {
         _stats = _stats.copyWith(
@@ -276,7 +271,6 @@ class MiningService extends ChangeNotifier {
       } else if (event is BlockFound) {
         // Ask the RPC to submit. First re-fetch template fields needed for the call.
         final template = await rpcClient.getBlockTemplate(walletAddress);
-        final sig = await getDeviceSignature(template.miningCommitment);
 
         try {
           await rpcClient.submitBlock(
@@ -286,9 +280,7 @@ class MiningService extends ChangeNotifier {
             timestamp: template.timestamp,
             bits: template.bits,
             nonce: event.nonce,
-            deviceId: deviceId,
             walletAddress: walletAddress,
-            deviceSignatureHex: sig,
             height: template.height,
           );
 
@@ -301,19 +293,11 @@ class MiningService extends ChangeNotifier {
 
           // Get fresh template for the next block
           final nextTemplate = await rpcClient.getBlockTemplate(walletAddress);
-          final nextSig = await getDeviceSignature(nextTemplate.miningCommitment);
-          _toIsolate?.send(NewTemplate(
-            template: nextTemplate,
-            deviceSignatureHex: nextSig,
-          ));
+          _toIsolate?.send(NewTemplate(template: nextTemplate));
         } catch (e) {
           // Block rejected (stale or invalid) — fetch fresh template and continue
           final nextTemplate = await rpcClient.getBlockTemplate(walletAddress);
-          final nextSig = await getDeviceSignature(nextTemplate.miningCommitment);
-          _toIsolate?.send(NewTemplate(
-            template: nextTemplate,
-            deviceSignatureHex: nextSig,
-          ));
+          _toIsolate?.send(NewTemplate(template: nextTemplate));
         }
       }
     };

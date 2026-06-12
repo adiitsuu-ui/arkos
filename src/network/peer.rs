@@ -9,7 +9,9 @@
 //! No application-level messages are exchanged until both sides have completed
 //! mutual authentication.
 
-use crate::network::noise::{generate_keypair, NoiseConn, NOISE_MAX_MESSAGE};
+use crate::network::noise::{
+    generate_keypair, NoiseConn, NoiseReader, NoiseWriter, NOISE_MAX_MESSAGE,
+};
 use crate::network::protocol::Message;
 use anyhow::Result;
 use tokio::net::TcpStream;
@@ -41,8 +43,7 @@ impl Peer {
     pub async fn from_stream(stream: TcpStream, addr: String) -> Result<Self> {
         let (mut reader, mut writer) = stream.into_split();
         let keypair = generate_keypair()?;
-        let transport =
-            NoiseConn::accept(&mut reader, &mut writer, &keypair).await?;
+        let transport = NoiseConn::accept(&mut reader, &mut writer, &keypair).await?;
         let conn = NoiseConn::from_transport(reader, writer, transport, addr.clone());
         Ok(Peer { addr, conn })
     }
@@ -60,6 +61,57 @@ impl Peer {
     pub async fn recv(&mut self) -> Result<Message> {
         let plaintext = self.conn.recv_raw().await?;
         Ok(serde_json::from_slice(&plaintext)?)
+    }
+
+    /// Split into independent read and write halves.
+    ///
+    /// The write half is returned first so callers can keep it in the current
+    /// task while moving the read half to a dedicated reader task.  This
+    /// eliminates the `select!` cancellation-safety hazard that arises when
+    /// `recv()` and a relay channel are selected simultaneously: a cancelled
+    /// `read_exact` mid-frame corrupts the Noise framing.
+    pub fn into_split(self) -> (PeerReader, PeerWriter) {
+        let addr = self.addr;
+        let (noise_reader, noise_writer) = self.conn.into_split();
+        (
+            PeerReader {
+                addr: addr.clone(),
+                conn: noise_reader,
+            },
+            PeerWriter {
+                addr,
+                conn: noise_writer,
+            },
+        )
+    }
+}
+
+/// Read half of a split [`Peer`] connection.
+pub struct PeerReader {
+    pub addr: String,
+    conn: NoiseReader,
+}
+
+impl PeerReader {
+    pub async fn recv(&mut self) -> Result<Message> {
+        let plaintext = self.conn.recv_raw().await?;
+        Ok(serde_json::from_slice(&plaintext)?)
+    }
+}
+
+/// Write half of a split [`Peer`] connection.
+pub struct PeerWriter {
+    pub addr: String,
+    conn: NoiseWriter,
+}
+
+impl PeerWriter {
+    pub async fn send(&mut self, msg: &Message) -> Result<()> {
+        let payload = serde_json::to_vec(msg)?;
+        if payload.len() > MAX_MSG_SIZE {
+            anyhow::bail!("message too large to send: {} bytes", payload.len());
+        }
+        self.conn.send_raw(&payload).await
     }
 }
 

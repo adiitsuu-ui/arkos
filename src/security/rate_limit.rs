@@ -4,8 +4,17 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Maximum number of distinct peers tracked per `RateLimiter`.
+///
+/// Without this cap, an attacker rotating through IP addresses could grow the
+/// `windows` HashMap without bound, exhausting node memory.  When the cap is
+/// reached, the oldest (first-inserted) entry is evicted to make room.
+const MAX_TRACKED_PEERS: usize = 4_096;
+
 pub struct RateLimiter {
     windows: HashMap<String, Vec<Instant>>,
+    /// Insertion-order key log for LRU-style eviction when the cap is reached.
+    insertion_order: Vec<String>,
     max_per_window: usize,
     window_duration: Duration,
 }
@@ -15,6 +24,7 @@ impl RateLimiter {
     pub fn new(max_per_window: usize, window_secs: u64) -> Self {
         RateLimiter {
             windows: HashMap::new(),
+            insertion_order: Vec::new(),
             max_per_window,
             window_duration: Duration::from_secs(window_secs),
         }
@@ -23,6 +33,18 @@ impl RateLimiter {
     /// Check if a peer is allowed to perform an action. Returns true if allowed.
     pub fn check(&mut self, peer_id: &str) -> bool {
         let now = Instant::now();
+
+        // Evict the oldest entry if the peer cap is reached and this is a new peer.
+        if !self.windows.contains_key(peer_id) && self.windows.len() >= MAX_TRACKED_PEERS {
+            if let Some(oldest) = self.insertion_order.first().cloned() {
+                self.windows.remove(&oldest);
+                self.insertion_order.retain(|k| k != &oldest);
+            }
+        }
+
+        if !self.windows.contains_key(peer_id) {
+            self.insertion_order.push(peer_id.to_string());
+        }
         let entries = self.windows.entry(peer_id.to_string()).or_default();
 
         // Remove expired entries
@@ -38,6 +60,9 @@ impl RateLimiter {
 
     /// Ban a peer by filling their window
     pub fn ban(&mut self, peer_id: &str) {
+        if !self.windows.contains_key(peer_id) {
+            self.insertion_order.push(peer_id.to_string());
+        }
         let entries = self.windows.entry(peer_id.to_string()).or_default();
         entries.clear();
         let now = Instant::now();
@@ -70,5 +95,11 @@ impl NodeRateLimiter {
             connections: RateLimiter::new(5, 60),
             getblocks: RateLimiter::new(10, 60),
         }
+    }
+}
+
+impl Default for NodeRateLimiter {
+    fn default() -> Self {
+        Self::new()
     }
 }

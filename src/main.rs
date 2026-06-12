@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod blockchain;
 mod crypto;
 mod mining;
@@ -14,6 +16,7 @@ use log::info;
 use std::path::PathBuf;
 
 use blockchain::chain::Blockchain;
+use network::discovery::collect_bootstrap_peers;
 use network::node::Node;
 use network::protocol::{MAINNET_MAGIC, REGTEST_MAGIC, TESTNET_MAGIC};
 use rpc::server::RpcServerConfig;
@@ -33,6 +36,9 @@ struct Cli {
     rpc_listen: String,
     #[arg(long)]
     peer: Vec<String>,
+    /// DNS seed hostnames for automatic peer discovery (can be repeated)
+    #[arg(long)]
+    dns_seed: Vec<String>,
     /// Data directory for vault, keys, and chain data
     #[arg(long, default_value = "~/.arkos")]
     datadir: String,
@@ -82,6 +88,19 @@ enum Command {
         #[arg(long, default_value = "default")]
         label: String,
     },
+    /// Show the 24-word recovery phrase for a wallet
+    ShowPhrase {
+        #[arg(long, default_value = "default")]
+        label: String,
+    },
+    /// Restore a wallet from a 24-word recovery phrase
+    RestoreWallet {
+        #[arg(long, default_value = "default")]
+        label: String,
+        /// Space-separated 24-word BIP39 phrase
+        #[arg(long)]
+        phrase: String,
+    },
     /// List wallets in the vault
     ListWallets,
     /// Show balance for an address
@@ -117,9 +136,9 @@ enum Command {
 }
 
 fn expand_datadir(s: &str) -> PathBuf {
-    if s.starts_with("~/") {
+    if let Some(stripped) = s.strip_prefix("~/") {
         if let Some(home) = dirs_home() {
-            return PathBuf::from(home).join(&s[2..]);
+            return PathBuf::from(home).join(stripped);
         }
     }
     PathBuf::from(s)
@@ -288,8 +307,8 @@ async fn main() -> Result<()> {
             }
             let revoked = RevocationList::load(&datadir.join("revoked.json")).unwrap_or_default();
             println!(
-                "{:<12} {:<16} {:<30} {}",
-                "TOKEN ID", "HOLDER", "PERMISSIONS", "STATUS"
+                "{:<12} {:<16} {:<30} STATUS",
+                "TOKEN ID", "HOLDER", "PERMISSIONS"
             );
             println!("{}", "-".repeat(75));
             for entry in std::fs::read_dir(&tokens_dir)? {
@@ -348,7 +367,7 @@ async fn main() -> Result<()> {
             let vault_path = datadir.join("vault.enc");
             let mut contents = vault::open_vault(&passphrase, &vault_path)?;
 
-            let w = Wallet::new();
+            let (w, mnemonic) = Wallet::generate_with_phrase();
             contents.secret_keys.push(w.secret_key_hex().to_string());
             contents.labels.push(label.clone());
 
@@ -360,13 +379,60 @@ async fn main() -> Result<()> {
             )?;
             println!("✅ Wallet '{}' created:", label);
             println!("   Address : {}", w.address());
-            println!("   Saved to encrypted vault.");
+            println!("   Saved to encrypted vault.\n");
+            println!("⚠️  RECOVERY PHRASE (write this down — never share it):");
+            println!("   {}\n", mnemonic);
+            println!("   The phrase recovers your ECDSA key and wallet address.");
+            println!("   Store it offline, separate from your vault file.");
+        }
+
+        Command::ShowPhrase { label } => {
+            let passphrase = prompt_passphrase(false)?;
+            let contents = vault::open_vault(&passphrase, &datadir.join("vault.enc"))?;
+            let idx = contents
+                .labels
+                .iter()
+                .position(|l| l == &label)
+                .ok_or_else(|| anyhow::anyhow!("wallet '{}' not found in vault", label))?;
+            let w = Wallet::from_secret_hex(&contents.secret_keys[idx])?;
+            let mnemonic = w.phrase();
+            println!("⚠️  RECOVERY PHRASE for wallet '{}':", label);
+            println!("   {}", mnemonic);
+            println!("\n   Keep this secret. Anyone with this phrase can recover");
+            println!("   your wallet address and spend your funds.");
+        }
+
+        Command::RestoreWallet { label, phrase } => {
+            let passphrase = prompt_passphrase(false)?;
+            let vault_path = datadir.join("vault.enc");
+            let mut contents = vault::open_vault(&passphrase, &vault_path)?;
+
+            if contents.labels.contains(&label) {
+                anyhow::bail!(
+                    "wallet '{}' already exists in vault; choose a different label",
+                    label
+                );
+            }
+
+            let w = Wallet::from_phrase(&phrase)?;
+            contents.secret_keys.push(w.secret_key_hex().to_string());
+            contents.labels.push(label.clone());
+
+            vault::create_vault(
+                &passphrase,
+                contents.secret_keys,
+                contents.labels,
+                &vault_path,
+            )?;
+            println!("✅ Wallet '{}' restored:", label);
+            println!("   Address : {}", w.address());
+            println!("   Note    : ML-DSA key is freshly generated (valid for all future spends).");
         }
 
         Command::ListWallets => {
             let passphrase = prompt_passphrase(false)?;
             let contents = vault::open_vault(&passphrase, &datadir.join("vault.enc"))?;
-            println!("{:<20} {}", "LABEL", "ADDRESS");
+            println!("{:<20} ADDRESS", "LABEL");
             println!("{}", "-".repeat(60));
             for (i, label) in contents.labels.iter().enumerate() {
                 if label == "master-key" {
@@ -393,7 +459,21 @@ async fn main() -> Result<()> {
             info!("Chain height: {}", chain.height());
 
             let node = Node::new(chain, cli.listen.clone(), magic);
-            for peer_addr in &cli.peer {
+
+            // Collect peers: explicit --peer flags first, then DNS bootstrap
+            let mut all_peers = cli.peer.clone();
+            if cli.dns_seed.is_empty() {
+                // Auto-DNS if no explicit --dns-seed flags (use defaults)
+                let dns_peers = collect_bootstrap_peers(&[]);
+                all_peers.extend(dns_peers);
+            } else {
+                let dns_peers = collect_bootstrap_peers(&cli.dns_seed);
+                all_peers.extend(dns_peers);
+            }
+            // Deduplicate preserving order
+            all_peers.dedup();
+
+            for peer_addr in &all_peers {
                 if let Err(e) = node.connect_to_peer(peer_addr).await {
                     log::warn!("Could not connect to {}: {}", peer_addr, e);
                 }
@@ -647,7 +727,10 @@ async fn main() -> Result<()> {
                 Err(_) => println!("   Classical attack : BLOCKED by ECDSA"),
             }
 
-            println!("\n✅ All checks passed — Arkos is quantum-secure!\n");
+            println!("\n✅ All demo checks passed.");
+            println!("   Hybrid ECDSA + ML-DSA-65 (NIST FIPS 204) signatures are in use.");
+            println!("   Note: UTXO addresses currently commit only to the ECDSA key.");
+            println!("   Full post-quantum protection requires address-format upgrade.\n");
         }
     }
 

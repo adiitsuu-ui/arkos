@@ -25,7 +25,11 @@ impl BlockStore {
 
     pub fn save_block(&self, block: &Block) -> Result<()> {
         let key = format!("block:{}", block.hash_hex());
-        let val = bincode::serialize(block)?;
+        // Use the same options as load_block_by_hash (FixintEncoding + AllowTrailing).
+        let val = bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .serialize(block)?;
         self.db.put(key.as_bytes(), &val)?;
         // Also index by height
         let height_key = format!("height:{}", block.height);
@@ -38,7 +42,11 @@ impl BlockStore {
         let key = format!("block:{}", hash);
         match self.db.get(key.as_bytes())? {
             Some(val) => {
+                // Must match bincode::serialize(): FixintEncoding + AllowTrailing.
+                // bincode::options() defaults to VarintEncoding, which is incompatible.
                 let block = bincode::options()
+                    .with_fixint_encoding()
+                    .allow_trailing_bytes()
                     .with_limit(MAX_BLOCK_SIZE)
                     .deserialize(&val)
                     .map_err(|e| anyhow::anyhow!("block deserialization failed: {}", e))?;
@@ -61,7 +69,10 @@ impl BlockStore {
 
     pub fn save_transaction(&self, tx: &Transaction) -> Result<()> {
         let key = format!("tx:{}", tx.txid_hex());
-        let val = bincode::serialize(tx)?;
+        let val = bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .serialize(tx)?;
         self.db.put(key.as_bytes(), &val)?;
         Ok(())
     }
@@ -71,6 +82,8 @@ impl BlockStore {
         match self.db.get(key.as_bytes())? {
             Some(val) => {
                 let tx = bincode::options()
+                    .with_fixint_encoding()
+                    .allow_trailing_bytes()
                     .with_limit(MAX_TX_SIZE)
                     .deserialize(&val)
                     .map_err(|e| anyhow::anyhow!("tx deserialization failed: {}", e))?;
