@@ -95,7 +95,7 @@ class _AppRouterState extends State<AppRouter> {
 
 /// Holds the user-configured node URL; notifies listeners on change.
 class NodeConfig extends ChangeNotifier {
-  String _nodeUrl = 'http://192.168.1.100:8334';
+  String _nodeUrl = 'http://127.0.0.1:8334';
   String? _rpcToken;
 
   String get nodeUrl => _nodeUrl;

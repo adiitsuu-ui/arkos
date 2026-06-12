@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod blockchain;
 mod crypto;
 mod mining;

@@ -60,7 +60,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     controller: _urlCtrl,
                     keyboardType: TextInputType.url,
                     decoration: const InputDecoration(
-                      hintText: 'http://192.168.1.100:8334',
+                      hintText: 'http://127.0.0.1:8334',
                       prefixIcon: Icon(Icons.dns_outlined),
                     ),
                   ),

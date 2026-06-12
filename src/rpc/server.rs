@@ -12,10 +12,11 @@
 //! { "jsonrpc": "2.0", "id": 1, "error": { "code": -32600, "message": "..." } }
 //! ```
 
-use std::sync::Arc;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json},
     routing::post,
@@ -26,6 +27,7 @@ use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
+use crate::security::rate_limit::RateLimiter;
 use super::methods::{handle, RpcRequest, RpcState};
 
 #[derive(Debug, Clone, Default)]
@@ -38,6 +40,8 @@ pub struct RpcServerConfig {
 struct ServerState {
     rpc: Arc<RpcState>,
     config: RpcServerConfig,
+    /// Per-IP rate limiter: 60 requests per 60-second window.
+    http_rate_limiter: Arc<Mutex<RateLimiter>>,
 }
 
 // ─── JSON-RPC 2.0 envelope ────────────────────────────────────────────────────
@@ -104,7 +108,11 @@ pub fn router(state: Arc<RpcState>, config: RpcServerConfig) -> anyhow::Result<R
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let server_state = Arc::new(ServerState { rpc: state, config });
+    let server_state = Arc::new(ServerState {
+        rpc: state,
+        config,
+        http_rate_limiter: Arc::new(Mutex::new(RateLimiter::new(60, 60))),
+    });
 
     Ok(Router::new()
         .route("/rpc", post(rpc_handler))
@@ -119,10 +127,21 @@ async fn health_handler() -> impl IntoResponse {
 
 /// Dispatch a JSON-RPC 2.0 request.
 async fn rpc_handler(
+    ConnectInfo(client_addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
     Json(envelope): Json<JsonRpcRequest>,
 ) -> impl IntoResponse {
+    // Per-IP rate limiting: 60 requests per minute
+    let ip = client_addr.ip().to_string();
+    if !state.http_rate_limiter.lock().unwrap().check(&ip) {
+        let id: Option<Value> = None;
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(JsonRpcResponse::err(id, -32005, "rate limit exceeded")),
+        );
+    }
+
     let id = envelope.id.clone();
 
     // Version check
@@ -243,7 +262,7 @@ pub async fn start_rpc_server(
     let app = router(state, config)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     log::info!("Arkos RPC server listening on http://{}", addr);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
