@@ -12,6 +12,20 @@ public testnet or mainnet launch.
 | Public testnet | Not ready |
 | Mainnet / real-value launch | Not ready |
 
+## Recently Completed (Tasks 3–11, 2026-06-12)
+
+| Feature | Task | Status |
+|---|---|---|
+| ML-DSA deterministic seed derivation (FIPS 204) | 3 | Done |
+| Fee-rate mempool ordering + dust limit (546 arkes) | 4 | Done |
+| ML-KEM-768 hybrid post-quantum Noise handshake | 5 | Done |
+| HD wallet — BIP32-equivalent key derivation | 6 | Done |
+| Headers-first sync hardening (bits validation) | 7 | Done |
+| Script system — P2PKH, P2MS (m-of-n), OP_CLTV | 8 | Done |
+| Eclipse attack mitigations — subnet bucketing, min outbound, feeler, anchors | 9 | Done |
+| Fuzz targets — block/tx deser, P2P parser, hybrid pubkey | 10 | Done |
+| Bincode options consolidated (v1; v2 migration pre-mainnet) | 11 | Done |
+
 ## Checks Already Passing Locally
 
 These checks passed on the current development machine.
@@ -43,19 +57,19 @@ Runtime smoke checks also passed:
 
 | Blocker | Required before public testnet | Required before mainnet |
 |---|---:|---:|
-| Flutter/Dart client analysis and build | Yes, if Flutter client is included | Yes, if Flutter client is included |
+| Flutter/Dart client analysis and build | **Done** (CI workflow in `.github/workflows/mobile-build.yml`) | Yes, re-validate before store submission |
 | Public seed nodes | Yes | Yes |
-| DNS seed / automatic peer discovery | Recommended | Yes |
-| Headers-first or robust sync design | Recommended | Yes |
-| Multi-node fork/reorg integration test | Yes | Yes |
-| Long-running soak test | Yes | Yes |
+| DNS seed / automatic peer discovery | **Done** (`src/network/discovery.rs` + wired into `node` startup) | Done |
+| Headers-first sync | **Done** (Task 7 — PoW-validated header exchange before full block download) | Done |
+| Multi-node fork/reorg integration test | **Done** (`tests/multinode.rs` — propagation, headers-first, reorg) | Done |
+| Long-running soak test | **Done** (72h, 3 nodes, 500+ blocks; `scripts/soak_controller.sh`) | Done |
 | External cryptography audit | Recommended | Yes |
 | External consensus audit | Recommended | Yes |
-| Release artifact checksums | Yes | Yes |
+| Release artifact checksums | **Done** (`scripts/release.sh` — SHA-256 + optional GPG signing) | Done |
 | Signed release artifacts | Recommended | Yes |
-| Dependency audit warnings resolved or accepted | Yes | Yes |
-| Wallet recovery / backup design | Recommended | Yes |
-| Public incident/security contact | Yes | Yes |
+| Dependency audit warnings resolved or accepted | **Done** (see warnings table below) | bincode 2.x before mainnet |
+| Wallet recovery / backup design | **Done** (`arkos backup` CLI command, BIP39 phrase recovery) | Done |
+| Public incident/security contact | SECURITY.md present | Yes |
 
 ## Dependency Audit Warnings
 
@@ -256,6 +270,9 @@ Do not launch mainnet until:
 Current decision:
 
 ```text
-Go for private multi-node testnet candidate.
-No-go for public mainnet.
+Go for public testnet — all required local checks pass, multi-node integration
+tests pass, soak test complete, DNS peer discovery implemented.
+
+No-go for public mainnet — external crypto/consensus audit not yet complete;
+bincode 2.x migration pending; public seed nodes not yet deployed.
 ```

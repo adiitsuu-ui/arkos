@@ -42,7 +42,11 @@ impl Blockchain {
     }
 
     pub fn new_for_network(network: &str) -> Self {
-        let bits = if network == "mainnet" { MAINNET_GENESIS_BITS } else { crate::blockchain::block::REGTEST_GENESIS_BITS };
+        let bits = match network {
+            "mainnet"         => MAINNET_GENESIS_BITS,
+            "testnet"         => crate::blockchain::block::TESTNET_GENESIS_BITS,
+            _ /* regtest */   => crate::blockchain::block::REGTEST_GENESIS_BITS,
+        };
         let magic = crate::network::protocol::magic_for_network(network);
         Self::from_genesis_with_magic(genesis_block_with_bits(bits), None, magic)
     }
@@ -70,7 +74,11 @@ impl Blockchain {
             return Ok(chain);
         }
 
-        let bits = if network == "mainnet" { MAINNET_GENESIS_BITS } else { crate::blockchain::block::REGTEST_GENESIS_BITS };
+        let bits = match network {
+            "mainnet"       => MAINNET_GENESIS_BITS,
+            "testnet"       => crate::blockchain::block::TESTNET_GENESIS_BITS,
+            _ /* regtest */ => crate::blockchain::block::REGTEST_GENESIS_BITS,
+        };
         let chain = Self::from_genesis(genesis_block_with_bits(bits), Some(store));
         if let Some(store) = &chain.store {
             store.save_block(chain.tip())?;
@@ -912,5 +920,248 @@ mod tests {
             result.is_err(),
             "coinbase with overflowing value must be rejected"
         );
+    }
+
+    // ── Script system tests (Tasks 7 & 8) ─────────────────────────────────
+
+    /// Build a UtxoSet with one output available to spend.
+    ///
+    /// Uses a non-coinbase transaction structure (non-zero prev_tx_hash, prev_index≠MAX)
+    /// so the UTXO is not subject to coinbase maturity checks.
+    fn make_utxo(output: crate::transaction::tx::TxOutput) -> (String, UtxoSet) {
+        use crate::transaction::tx::{Transaction, TxInput};
+        use crate::crypto::quantum::{HybridPublicKey, HybridSignature};
+        // Non-coinbase: prev_tx_hash is non-zero, prev_index ≠ u32::MAX
+        let fake_tx = Transaction {
+            inputs: vec![TxInput {
+                prev_tx_hash: "ab".repeat(32), // non-zero → not a coinbase
+                prev_index: 0,
+                signature: HybridSignature { ecdsa_sig: vec![], dilithium_sig: vec![] },
+                pubkey: HybridPublicKey { ecdsa_pubkey: vec![], dilithium_pubkey: vec![] },
+                coinbase_extra: vec![],
+                witnesses: vec![],
+            }],
+            outputs: vec![output],
+            version: 1,
+            lock_time: 0,
+        };
+        let txid = fake_tx.txid_hex();
+        let mut utxo_set = UtxoSet::default();
+        utxo_set.apply_transaction(&fake_tx);
+        (txid, utxo_set)
+    }
+
+    /// Build a spending transaction (signed) from a UTXO at txid:0 with the given keypair.
+    fn spend_utxo(
+        txid: &str,
+        kp: &crate::crypto::quantum::HybridKeyPair,
+        witnesses: Vec<(crate::crypto::quantum::HybridSignature, crate::crypto::quantum::HybridPublicKey)>,
+        output_value: u64,
+        network_magic: u32,
+    ) -> crate::transaction::tx::Transaction {
+        use crate::transaction::tx::{Transaction, TxInput, TxOutput};
+        use crate::crypto::quantum::HybridSignature;
+        let pubkey = kp.public_key();
+        let unsigned = Transaction::new(
+            vec![TxInput {
+                prev_tx_hash: txid.to_string(),
+                prev_index: 0,
+                signature: HybridSignature { ecdsa_sig: vec![], dilithium_sig: vec![] },
+                pubkey: pubkey.clone(),
+                coinbase_extra: vec![],
+                witnesses: vec![],
+            }],
+            vec![TxOutput { value: output_value, address: "out".into(), script: None }],
+        );
+        let sig_hash = unsigned.sig_hash(network_magic);
+        let sig = kp.sign(&sig_hash);
+        Transaction::new(
+            vec![TxInput {
+                prev_tx_hash: txid.to_string(),
+                prev_index: 0,
+                signature: sig,
+                pubkey: pubkey.clone(),
+                coinbase_extra: vec![],
+                witnesses,
+            }],
+            vec![TxOutput { value: output_value, address: "out".into(), script: None }],
+        )
+    }
+
+    fn addr_of(kp: &crate::crypto::quantum::HybridKeyPair) -> String {
+        let pk = kp.public_key();
+        let ecdsa_pub = secp256k1::PublicKey::from_slice(&pk.ecdsa_pubkey).unwrap();
+        hex::encode(hybrid_pubkey_to_address(&ecdsa_pub, &pk.dilithium_pubkey))
+    }
+
+    #[test]
+    fn p2pkh_valid_signature_accepted() {
+        use crate::crypto::quantum::HybridKeyPair;
+        use crate::network::protocol::TESTNET_MAGIC;
+        let kp = HybridKeyPair::generate();
+        let addr = addr_of(&kp);
+        let (txid, utxo_set) = make_utxo(crate::transaction::tx::TxOutput::p2pkh(&addr, 100_000));
+        let tx = spend_utxo(&txid, &kp, vec![], 99_000, TESTNET_MAGIC);
+        let result = validate_tx_with_utxo(&tx, &utxo_set, TESTNET_MAGIC, 0);
+        assert!(result.is_ok(), "valid P2PKH spend must be accepted: {:?}", result.err());
+    }
+
+    #[test]
+    fn p2pkh_wrong_key_rejected() {
+        use crate::crypto::quantum::HybridKeyPair;
+        use crate::network::protocol::TESTNET_MAGIC;
+        let kp_owner = HybridKeyPair::generate();
+        let kp_attacker = HybridKeyPair::generate();
+        let addr = addr_of(&kp_owner);
+        let (txid, utxo_set) = make_utxo(crate::transaction::tx::TxOutput::p2pkh(&addr, 100_000));
+        // Attacker signs with their key but tries to spend owner's UTXO
+        let tx = spend_utxo(&txid, &kp_attacker, vec![], 99_000, TESTNET_MAGIC);
+        let result = validate_tx_with_utxo(&tx, &utxo_set, TESTNET_MAGIC, 0);
+        assert!(result.is_err(), "spend with wrong key must be rejected");
+        assert!(result.unwrap_err().to_string().contains("P2PKH pubkey does not match address"));
+    }
+
+    #[test]
+    fn p2ms_2_of_3_accepted() {
+        use crate::crypto::quantum::HybridKeyPair;
+        use crate::network::protocol::TESTNET_MAGIC;
+        use crate::transaction::tx::{Transaction, TxInput, TxOutput};
+        use crate::crypto::quantum::HybridSignature;
+        let kp1 = HybridKeyPair::generate();
+        let kp2 = HybridKeyPair::generate();
+        let kp3 = HybridKeyPair::generate();
+        let pk1 = kp1.public_key();
+        let pk2 = kp2.public_key();
+        let pk3 = kp3.public_key();
+
+        let ms_out = TxOutput::p2ms(2, vec![pk1.clone(), pk2.clone(), pk3.clone()], 100_000);
+        let (txid, utxo_set) = make_utxo(ms_out);
+
+        // kp1 in primary slot, kp2 as witness
+        let unsigned = Transaction::new(
+            vec![TxInput {
+                prev_tx_hash: txid.clone(),
+                prev_index: 0,
+                signature: HybridSignature { ecdsa_sig: vec![], dilithium_sig: vec![] },
+                pubkey: pk1.clone(),
+                coinbase_extra: vec![],
+                witnesses: vec![],
+            }],
+            vec![TxOutput { value: 99_000, address: "out".into(), script: None }],
+        );
+        let sig_hash = unsigned.sig_hash(TESTNET_MAGIC);
+        let sig1 = kp1.sign(&sig_hash);
+        let sig2 = kp2.sign(&sig_hash);
+        let signed = Transaction::new(
+            vec![TxInput {
+                prev_tx_hash: txid,
+                prev_index: 0,
+                signature: sig1,
+                pubkey: pk1.clone(),
+                coinbase_extra: vec![],
+                witnesses: vec![(sig2, pk2.clone())],
+            }],
+            vec![TxOutput { value: 99_000, address: "out".into(), script: None }],
+        );
+        let result = validate_tx_with_utxo(&signed, &utxo_set, TESTNET_MAGIC, 0);
+        assert!(result.is_ok(), "2-of-3 P2MS with valid sigs must be accepted: {:?}", result.err());
+    }
+
+    #[test]
+    fn p2ms_insufficient_sigs_rejected() {
+        use crate::crypto::quantum::HybridKeyPair;
+        use crate::network::protocol::TESTNET_MAGIC;
+        use crate::transaction::tx::TxOutput;
+        let kp1 = HybridKeyPair::generate();
+        let kp2 = HybridKeyPair::generate();
+        let pk1 = kp1.public_key();
+        let pk2 = kp2.public_key();
+
+        let ms_out = TxOutput::p2ms(2, vec![pk1.clone(), pk2.clone()], 100_000);
+        let (txid, utxo_set) = make_utxo(ms_out);
+        // Only 1 sig provided (no witnesses)
+        let tx = spend_utxo(&txid, &kp1, vec![], 99_000, TESTNET_MAGIC);
+        let result = validate_tx_with_utxo(&tx, &utxo_set, TESTNET_MAGIC, 0);
+        assert!(result.is_err(), "2-of-2 P2MS with only 1 sig must be rejected");
+        assert!(result.unwrap_err().to_string().contains("P2MS"));
+    }
+
+    #[test]
+    fn cltv_rejects_spend_before_unlock() {
+        use crate::crypto::quantum::HybridKeyPair;
+        use crate::network::protocol::TESTNET_MAGIC;
+        use crate::transaction::tx::{Script, TxOutput};
+        let kp = HybridKeyPair::generate();
+        let addr = addr_of(&kp);
+        // Lock until block_time=1000 (height ~2, since height*600=1200 ≥ 1000 only at height≥2)
+        let lock_until = 1_000u64;
+        let inner = Script::P2PKH { address: addr.clone() };
+        let locked_out = TxOutput::time_locked(lock_until, inner, 100_000);
+        let (txid, utxo_set) = make_utxo(locked_out);
+        let tx = spend_utxo(&txid, &kp, vec![], 99_000, TESTNET_MAGIC);
+        // height=1 → block_time=600 < 1000 → locked
+        let result = validate_tx_with_utxo(&tx, &utxo_set, TESTNET_MAGIC, 1);
+        assert!(result.is_err(), "CLTV-locked output must be rejected before unlock time");
+        assert!(result.unwrap_err().to_string().contains("CLTV"));
+    }
+
+    #[test]
+    fn cltv_accepts_spend_after_unlock() {
+        use crate::crypto::quantum::HybridKeyPair;
+        use crate::network::protocol::TESTNET_MAGIC;
+        use crate::transaction::tx::{Script, TxOutput};
+        let kp = HybridKeyPair::generate();
+        let addr = addr_of(&kp);
+        // Lock until exactly height=1 block_time (600s)
+        let lock_until = 600u64;
+        let inner = Script::P2PKH { address: addr.clone() };
+        let locked_out = TxOutput::time_locked(lock_until, inner, 100_000);
+        let (txid, utxo_set) = make_utxo(locked_out);
+        let tx = spend_utxo(&txid, &kp, vec![], 99_000, TESTNET_MAGIC);
+        // height=1 → block_time=600 ≥ 600 → unlocked
+        let result = validate_tx_with_utxo(&tx, &utxo_set, TESTNET_MAGIC, 1);
+        assert!(result.is_ok(), "CLTV output must be spendable at unlock time: {:?}", result.err());
+    }
+
+    #[test]
+    fn dust_limit_enforced_in_tx_validation() {
+        use crate::crypto::quantum::HybridKeyPair;
+        use crate::network::protocol::TESTNET_MAGIC;
+        use crate::transaction::tx::{Transaction, TxInput, TxOutput};
+        use crate::crypto::quantum::HybridSignature;
+        use crate::transaction::mempool::DUST_LIMIT_ARKES;
+
+        let kp = HybridKeyPair::generate();
+        let pk = kp.public_key();
+        let addr = addr_of(&kp);
+        let (txid, utxo_set) = make_utxo(TxOutput::p2pkh(&addr, 100_000));
+
+        let unsigned = Transaction::new(
+            vec![TxInput {
+                prev_tx_hash: txid.clone(),
+                prev_index: 0,
+                signature: HybridSignature { ecdsa_sig: vec![], dilithium_sig: vec![] },
+                pubkey: pk.clone(),
+                coinbase_extra: vec![],
+                witnesses: vec![],
+            }],
+            vec![TxOutput { value: DUST_LIMIT_ARKES - 1, address: "out".into(), script: None }],
+        );
+        let sig_hash = unsigned.sig_hash(TESTNET_MAGIC);
+        let sig = kp.sign(&sig_hash);
+        let signed = Transaction::new(
+            vec![TxInput {
+                prev_tx_hash: txid,
+                prev_index: 0,
+                signature: sig,
+                pubkey: pk.clone(),
+                coinbase_extra: vec![],
+                witnesses: vec![],
+            }],
+            vec![TxOutput { value: DUST_LIMIT_ARKES - 1, address: "out".into(), script: None }],
+        );
+        let result = validate_tx_with_utxo(&signed, &utxo_set, TESTNET_MAGIC, 0);
+        assert!(result.is_err(), "output below dust limit must be rejected");
+        assert!(result.unwrap_err().to_string().contains("dust limit"));
     }
 }

@@ -101,6 +101,12 @@ enum Command {
     },
     /// List wallets in the vault
     ListWallets,
+    /// Back up the encrypted vault to a file you control
+    Backup {
+        /// Destination path for the backup (e.g. /media/usb/vault.enc.backup)
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Show balance for an address
     Balance {
         #[arg(long)]
@@ -422,9 +428,11 @@ async fn main() -> Result<()> {
                 contents.labels,
                 &vault_path,
             )?;
-            println!("✅ Wallet '{}' restored:", label);
+            println!("Wallet '{}' restored:", label);
             println!("   Address : {}", w.address());
-            println!("   Note    : ML-DSA key is freshly generated (valid for all future spends).");
+            println!("   ECDSA   : recovered from phrase (deterministic)");
+            println!("   ML-DSA  : recovered from phrase (deterministic via HMAC-SHA256)");
+            println!("   Both signing keys are identical to the original wallet.");
         }
 
         Command::ListWallets => {
@@ -442,8 +450,36 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::Backup { output } => {
+            let vault_path = datadir.join("vault.enc");
+            if !vault_path.exists() {
+                anyhow::bail!("vault not found at {}; run `arkos init` first", vault_path.display());
+            }
+            // Verify the passphrase opens the vault before writing the backup.
+            let passphrase = prompt_passphrase(false)?;
+            vault::open_vault(&passphrase, &vault_path)?;
+
+            if let Some(parent) = output.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            std::fs::copy(&vault_path, &output)?;
+            println!("Vault backed up to: {}", output.display());
+            println!();
+            println!("Recovery instructions:");
+            println!("  1. Keep this file offline (USB drive, encrypted disk).");
+            println!("  2. To restore: copy the file to ~/.arkos/vault.enc");
+            println!("     and run `arkos list-wallets` to verify.");
+            println!("  3. The vault is AES-256-GCM encrypted — your passphrase");
+            println!("     is also required to decrypt it. Store them separately.");
+            println!("  4. For each wallet you also have a 24-word BIP39 phrase");
+            println!("     (`arkos show-phrase --label <name>`) — that phrase alone");
+            println!("     can restore the address if you lose the vault file.");
+        }
+
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        //  CHAIN COMMANDS (same as before)
+        //  CHAIN COMMANDS
         // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         Command::Node { miner } => {
             std::fs::create_dir_all(&network_datadir)?;

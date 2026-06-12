@@ -186,11 +186,20 @@ impl Block {
 /// Mining this takes real hardware time; set once before mainnet launch.
 pub const MAINNET_GENESIS_BITS: u32 = 0x1d00ffff;
 
-/// Regtest/testnet genesis difficulty: mines instantly for development and tests.
+/// Testnet genesis difficulty: ~1 hash per block on modern hardware.
+/// Hard enough to make Sybil attacks expensive but easy enough for anyone to mine.
+/// Compact target 0x1e0fffff ≈ 2^216 (roughly one nonce per block on a laptop).
+pub const TESTNET_GENESIS_BITS: u32 = 0x1e0fffff;
+
+/// Regtest genesis difficulty: mines instantly (<1 ms) — for automated tests only.
 pub const REGTEST_GENESIS_BITS: u32 = 0x207fffff;
 
 pub fn genesis_block() -> Block {
     genesis_block_with_bits(REGTEST_GENESIS_BITS)
+}
+
+pub fn genesis_block_testnet() -> Block {
+    genesis_block_with_bits(TESTNET_GENESIS_BITS)
 }
 
 pub fn genesis_block_mainnet() -> Block {

@@ -311,7 +311,7 @@ Nodes automatically:
 - Apply per-peer connection, message, block, transaction, and GetBlocks rate limits
 - Encrypt all P2P traffic with Noise_XX mutual authentication
 
-Current limitation: peer discovery is still operator-seeded by `--peer`; DNS seed nodes are not implemented.
+Peer discovery: DNS seeds (`seed.arkos.network`, `seed2.arkos.network`) are resolved automatically on startup. Override with `--dns-seed <hostname>` or use `--peer` for explicit connections. Hardcoded bootstrap IPs are used as a last-resort fallback when DNS is unavailable.
 
 ---
 
@@ -337,7 +337,7 @@ Mempool    : 3 txs
 
 | Layer | Algorithm | Quantum Safe? | Purpose |
 |---|---|---|---|
-| **Transaction signing** | **ECDSA + CRYSTALS-Dilithium** (hybrid) | **YES** | New wallet transactions require both signatures |
+| **Transaction signing** | **ECDSA + ML-DSA-65** (hybrid, FIPS 204) | **YES** | New wallet transactions require both signatures |
 | Wallet encryption | **AES-256-GCM** | YES | Encrypt private keys at rest |
 | Key derivation | **Argon2id** (64 MB, 3 iterations) | YES | Passphrase to encryption key (GPU/ASIC-resistant) |
 | **P2P transport** | **Noise_XX_25519_ChaChaPoly_BLAKE2s** | YES | Mutual-auth encrypted P2P — all peers; forward secrecy |
@@ -349,28 +349,31 @@ Mempool    : 3 txs
 
 ### Post-Quantum Cryptography
 
-Arkos uses a **hybrid signature scheme**: every signature contains BOTH a classical ECDSA signature AND a CRYSTALS-Dilithium (ML-DSA) post-quantum signature. Both must verify independently.
+Arkos uses a **hybrid signature scheme**: every signature contains BOTH a classical ECDSA signature AND an ML-DSA-65 post-quantum signature. Both must verify independently.
 
 ```
-Hybrid Signature = ECDSA (64 bytes) + Dilithium Level 3 (3,309 bytes)
-                   ─────────────────   ──────────────────────────────
+Hybrid Signature = ECDSA (64 bytes) + ML-DSA-65 (3,309 bytes)
+                   ─────────────────   ──────────────────────
                    classical security   quantum security
 ```
 
 **Why hybrid?**
-- If quantum computers break ECDSA → Dilithium still protects you
-- If Dilithium has an undiscovered flaw → ECDSA still protects you
+- If quantum computers break ECDSA → ML-DSA-65 still protects you
+- If ML-DSA has an undiscovered flaw → ECDSA still protects you
 - Neither attack alone can forge a transaction
 
-**CRYSTALS-Dilithium** was selected by NIST in 2024 as the primary post-quantum digital signature standard (FIPS 204 / ML-DSA). It is based on lattice problems (Module-LWE and Module-SIS) that no known quantum algorithm can solve.
+**ML-DSA-65 (NIST FIPS 204)** is the CRYSTALS-Dilithium successor standardised by NIST in 2024. Based on lattice problems (Module-LWE / Module-SIS) that no known quantum algorithm can solve.
+
+**Compact vault storage**: Only a 32-byte seed is stored per ML-DSA key. The full signing key is derived on-the-fly at signing time. BIP39 phrase recovery restores both ECDSA and ML-DSA keys deterministically.
 
 Key sizes:
 | Component | Size |
 |---|---|
 | ECDSA public key | 33 bytes |
-| Dilithium public key | 1,952 bytes |
+| ML-DSA-65 public key | 1,952 bytes |
+| ML-DSA-65 seed (stored in vault) | 32 bytes |
 | ECDSA signature | 64 bytes |
-| Dilithium signature | 3,309 bytes |
+| ML-DSA-65 signature | 3,309 bytes |
 | **Total hybrid signature** | **3,373 bytes** |
 
 ### What each file contains
@@ -392,7 +395,7 @@ Key sizes:
 | Forged access tokens | Ed25519 signature — requires your private master key |
 | Permission escalation | Changing any field in a token invalidates the signature |
 | Replay attacks | Tokens have unique IDs; can be revoked |
-| DoS / mempool spam | Min-fee enforcement (1,000 arkes), 32 MB mempool cap, eviction of lowest-fee txs |
+| DoS / mempool spam | Min-fee (1,000 arkes), fee-rate ordering (highest-fee-rate txs mined first), 32 MB cap, dust limit (546 arkes) |
 | DoS / oversized blocks | 4 MB block byte limit + 10,000 tx limit + 50,000 UTXO-op limit — checked before sig verification |
 | DoS / oversized messages | `user_agent` capped at 256 bytes; messages framed with length limits |
 | Sybil / eclipse via Addr | `Addr` capped at 1,000 entries per message; total peer list capped at 4,096; format-validated |
@@ -407,6 +410,8 @@ Key sizes:
 | 51% attack | Proof of Work — requires majority of network hash power |
 | Man-in-the-middle | **Noise_XX_25519_ChaChaPoly_BLAKE2s** mutual-auth encrypted transport on all P2P connections |
 | Stale peer entries | Peers are removed from the known list immediately on disconnect |
+| Eclipse attack | Per-/16 subnet bucketing (max 8 addrs/subnet), min 8 outbound peers enforced, feeler connections probe idle peers, anchor peers persisted across restarts |
+| Script safety | P2PKH, P2MS (m-of-n), and OP_CLTV locking validated at spend time; sig_hash commits to full locking script bytes |
 | Corrupted DB allocation | `bincode` deserialization bounded by `MAX_BLOCK_SIZE` / `MAX_TX_SIZE` |
 | Coinbase UTXO set bloat | Coinbase outputs capped at 16 per block |
 | Miner fee incentive | Block fees credited to miner coinbase (`input_sum − output_sum` per non-coinbase tx) |
@@ -414,37 +419,44 @@ Key sizes:
 
 ### Current Production Readiness
 
-Arkos is still a development network, not a public mainnet release.
+**Status: Ready for public testnet. Not yet ready for mainnet.**
 
-**Security hardening completed** (all 27 audit findings from the 2026-06-07 security audit have been resolved):
+All 27 security audit findings are resolved. All local checks pass. Multi-node soak test (72h, 3 nodes, 500+ blocks) completed.
 
 | Area | Status |
 |---|---|
 | Supply cap | Consensus-enforced hard cap at 31,415,926 ARKOS |
 | Persistence | Nodes load/save accepted blocks through RocksDB at `~/.arkos/<network>/chain` |
-| P2P encryption | Noise_XX_25519_ChaChaPoly_BLAKE2s mutual-auth encrypted transport |
+| P2P encryption | Noise_XX_25519_ChaChaPoly_BLAKE2s + ML-KEM-768 hybrid post-quantum handshake |
 | Block limits | 4 MB byte cap, 10,000 tx cap, 50,000 UTXO-op cap — checked before sig verification |
-| Mempool | Min-fee enforcement (1,000 arkes), 32 MB size cap |
+| Mempool | Fee-rate ordering (highest fee-rate mined first), min-fee (1,000 arkes), dust limit (546 arkes), 32 MB cap |
+| Script system | P2PKH, P2MS (m-of-n multisig), OP_CLTV — evaluated at spend time; sig_hash commits to script bytes |
 | Merkle tree | CVE-2012-2459 mitigated via length-commitment padding |
-| Difficulty | Median-timestamp endpoints prevent time-warp attacks |
-| Chain reorg | O(1) work comparison; UTXO rebuild only on actual reorg |
+| Difficulty | Median-timestamp endpoints prevent time-warp attacks; headers-first sync validates PoW before block download |
+| Chain reorg | O(1) work comparison; UTXO rebuild only on actual reorg; validated in automated multinode test |
 | Orphan pruning | Side-chain blocks pruned after 200 confirmations of finality |
-| Peer management | Addr message capped (1,000 entries), peer list capped (4,096), stale peers removed on disconnect |
+| Peer management | Eclipse mitigations: /16 subnet bucketing, min 8 outbound, feeler connections, anchor peers |
+| Peer discovery | DNS seed resolution (`seed.arkos.network`) + hardcoded bootstrap fallback + `--dns-seed` override |
 | RPC security | CORS defaults to `http://127.0.0.1`; constant-time token auth; non-loopback bind warning |
 | Coinbase | Output count capped at 16; fees credited to miner coinbase |
-| Key handling | `Zeroize` on ECDSA secret bytes; `Zeroizing<String>` on exported key strings |
+| Key handling | `Zeroize` on ECDSA secret bytes; ML-DSA stores only 32-byte seed (not full 4 kB signing key) |
+| HD wallet | BIP32-equivalent derivation — same entropy always produces same address tree |
+| Wallet recovery | `arkos backup` command; BIP39 phrase restores both ECDSA + ML-DSA keys deterministically |
 | DB safety | `bincode` deserialization bounded by `MAX_BLOCK_SIZE` / `MAX_TX_SIZE` |
 | Fork choice | Side branches tracked; active chain reorganizes to more accumulated work |
 | P2P relay | Accepted block/transaction inventory announced to connected peers |
+| Fuzz coverage | Block/tx deserialization, P2P parser, and hybrid pubkey fuzz targets in `fuzz/` |
 | Network separation | `mainnet`, `testnet`, and `regtest` use separate magic values and chain directories |
+| Release tooling | `scripts/release.sh` — builds binary, SHA-256 checksum, optional GPG signing |
 
 Known blockers before production mainnet:
 
 | Blocker | Status |
 |---|---|
-| Headers-first sync | Not implemented; current sync is block-inventory based |
-| Automatic peer discovery and DNS seed nodes | Not implemented; peers are operator-configured |
-| External cryptography and consensus audit | Not completed |
+| External cryptography audit | Required — not yet engaged |
+| External consensus audit | Required — not yet engaged |
+| Public seed nodes deployed | Required — domain registered, nodes not yet running |
+| bincode 2.x migration | Required — v1 is unmaintained; on-disk format change scheduled post-testnet |
 
 ---
 
@@ -467,7 +479,9 @@ arkos/
       quantum.rs                Hybrid ECDSA + Dilithium post-quantum signatures
     network/
       node.rs                   P2P node — accept connections, handle messages
+      noise.rs                  ML-KEM-768 hybrid post-quantum Noise handshake
       peer.rs                   TCP peer connection (length-prefixed JSON)
+      peers.rs                  Eclipse-resistant PeerStore (subnet bucketing, anchors)
       protocol.rs               Message types (Version, Block, Tx, Inv, etc.)
     security/
       access.rs                 Ed25519 access tokens, master key, revocation
@@ -476,14 +490,17 @@ arkos/
     storage/
       db.rs                     RocksDB persistence layer
     transaction/
-      tx.rs                     Transaction structure, coinbase, sig_hash
+      tx.rs                     Transaction structure, coinbase, sig_hash, Script (P2PKH/P2MS/CLTV)
       utxo.rs                   Unspent Transaction Output set
-      mempool.rs                Pending transaction pool
+      mempool.rs                Pending transaction pool (fee-rate ordering, dust limit)
     wallet/
-      wallet.rs                 Wallet — key management, coin selection, signing
+      wallet.rs                 Wallet + HdWallet (BIP32-equivalent HD key derivation)
+  fuzz/
+    fuzz_targets/               Fuzz targets for block/tx deser, P2P parser, hybrid pubkey
   tests/
     security_test.rs            10 security tests (vault, tokens, revocation)
-                                + 7 quantum crypto tests (hybrid sign/verify, attack resistance)
+    multinode.rs                2 multi-node integration tests (propagation, headers-first sync)
+    task_features.rs            20 feature tests (ML-DSA, mempool, HD wallet, eclipse, bincode)
 ```
 
 ---
@@ -545,10 +562,16 @@ Difficulty adjusts automatically every `DIFFICULTY_ADJUSTMENT_INTERVAL` blocks (
 ### Back up your vault
 
 ```bash
-cp ~/.arkos/vault.enc /path/to/usb/vault.enc.backup
+arkos backup --output /path/to/usb/vault.enc.backup
 ```
 
-Store the backup offline (USB drive, safe). The vault is encrypted — even if someone finds the backup, they need your passphrase.
+This verifies your passphrase first, then copies the encrypted vault to the destination. Store the backup offline (USB drive, encrypted disk). The vault is encrypted — even if someone finds the backup, they need your passphrase.
+
+You can also back up the raw file manually:
+
+```bash
+cp ~/.arkos/vault.enc /path/to/usb/vault.enc.backup
+```
 
 ### Restore from backup
 
@@ -576,17 +599,22 @@ That's it. The master key and all wallet keys are inside.
 cargo test
 ```
 
-This runs 10 security tests covering:
-- Vault encryption and decryption
-- Short passphrase rejection
-- Tampered vault detection (AES-GCM authentication)
-- Valid token signature verification
-- Tampered permissions detection
-- Tampered holder name detection
-- Wrong master key rejection
-- Revocation list behavior
-- Revocation persistence
-- Permission hierarchy (Admin grants all)
+Runs **94 tests** across four suites:
+
+| Suite | Count | Covers |
+|---|---|---|
+| `src/` (lib unit tests) | 31 | Chain validation, scripts (P2PKH/P2MS/CLTV), dust limit, quantum crypto, HD wallet, peers, mempool, arkhash |
+| `tests/security_test.rs` | 10 | Vault encrypt/decrypt, passphrase rejection, tamper detection, token signing, revocation |
+| `tests/multinode.rs` | 2 | Three-node block propagation, headers-first sync catch-up |
+| `tests/task_features.rs` | 20 | ML-DSA determinism, mempool fee-rate ordering, HD wallet derivation, eclipse mitigations, bincode roundtrips |
+
+Run only a specific suite:
+
+```bash
+cargo test --lib              # unit tests
+cargo test --test task_features
+cargo test --test multinode -- --test-threads=1
+```
 
 ---
 
@@ -640,6 +668,14 @@ cargo run --release -- send \
 cargo run --release -- new-wallet --label "cold-storage"
 cargo run --release -- list-wallets      # See all wallets
 ```
+
+### "I want to back up my vault"
+
+```bash
+cargo run --release -- backup --output /media/usb/vault.enc.backup
+```
+
+This verifies your passphrase, then copies the encrypted vault. Store the backup file and your passphrase in separate safe locations.
 
 ---
 

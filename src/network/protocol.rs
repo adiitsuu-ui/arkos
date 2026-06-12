@@ -7,6 +7,14 @@ pub const MAINNET_MAGIC: u32 = 0x4152_4b53; // "ARKS"
 pub const TESTNET_MAGIC: u32 = 0x4152_4b54; // "ARKT"
 pub const REGTEST_MAGIC: u32 = 0x4152_4b52; // "ARKR"
 
+pub fn magic_for_network(network: &str) -> u32 {
+    match network {
+        "mainnet" => MAINNET_MAGIC,
+        "testnet" => TESTNET_MAGIC,
+        _ => REGTEST_MAGIC,
+    }
+}
+
 /// Maximum number of block headers returned in a single `Headers` message.
 pub const MAX_HEADERS_PER_RESPONSE: usize = 2_000;
 

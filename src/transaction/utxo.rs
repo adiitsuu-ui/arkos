@@ -9,11 +9,16 @@ pub struct Utxo {
     pub output: TxOutput,
 }
 
+/// Blocks until a coinbase output can be spent (matches Bitcoin).
+pub const COINBASE_MATURITY: u64 = 100;
+
 /// In-memory UTXO set. In production this would be backed by RocksDB.
 #[derive(Default, Clone)]
 pub struct UtxoSet {
     // key: "txhash:index"
     utxos: HashMap<String, TxOutput>,
+    // coinbase txid -> block height at which it was mined
+    coinbase_heights: HashMap<String, u64>,
 }
 
 impl UtxoSet {
@@ -31,9 +36,29 @@ impl UtxoSet {
         }
         // Add new outputs
         let txid = tx.txid_hex();
+        if tx.is_coinbase() {
+            // Extract block height from coinbase_extra (little-endian u64)
+            let height = tx.inputs[0].coinbase_extra
+                .get(..8)
+                .and_then(|b| b.try_into().ok())
+                .map(u64::from_le_bytes)
+                .unwrap_or(0);
+            self.coinbase_heights.insert(txid.clone(), height);
+        }
         for (i, output) in tx.outputs.iter().enumerate() {
             let k = Self::key(&txid, i as u32);
             self.utxos.insert(k, output.clone());
+        }
+    }
+
+    /// Returns true if the UTXO is a coinbase output that has not yet matured.
+    /// `current_height` is the height of the block being validated.
+    pub fn is_immature_coinbase(&self, tx_hash: &str, current_height: u64) -> bool {
+        if let Some(&mined_at) = self.coinbase_heights.get(tx_hash) {
+            let confirmations = current_height.saturating_sub(mined_at);
+            confirmations < COINBASE_MATURITY
+        } else {
+            false
         }
     }
 

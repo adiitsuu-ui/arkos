@@ -164,3 +164,76 @@ async fn test_initial_sync_via_headers_first() {
     wait_sync(&[node_a.clone(), node_b.clone()], 2, 15).await;
     assert_consensus(&[node_a, node_b]).await;
 }
+
+/// Chain reorganisation: node A builds a 2-block chain, node B independently
+/// builds a 3-block chain, then they connect.  All nodes must converge on B's
+/// longer chain (more accumulated work).
+///
+/// This validates the fork-choice rule: heaviest chain wins, not first-seen.
+#[tokio::test]
+async fn test_reorg_longer_chain_wins() {
+    let _ = env_logger::try_init();
+
+    // Two isolated nodes — no connection yet.
+    let node_a = Arc::new(Node::new(
+        Blockchain::new(),
+        "127.0.0.1:19021".into(),
+        MAGIC,
+    ));
+    let node_b = Arc::new(Node::new(
+        Blockchain::new(),
+        "127.0.0.1:19022".into(),
+        MAGIC,
+    ));
+
+    let na = node_a.clone();
+    tokio::spawn(async move { let _ = na.run().await; });
+    let nb = node_b.clone();
+    tokio::spawn(async move { let _ = nb.run().await; });
+    sleep(Duration::from_millis(100)).await;
+
+    const MINER_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const MINER_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    // A mines 2 blocks — its chain has less accumulated work than B's 3-block chain.
+    for _ in 0..2 {
+        node_a.mine_block_and_relay(MINER_A).await.expect("A mine");
+    }
+    assert_eq!(node_a.chain.lock().await.height(), 2, "A should be at height 2");
+
+    // B independently mines 3 blocks (more work).
+    for _ in 0..3 {
+        node_b.mine_block_and_relay(MINER_B).await.expect("B mine");
+    }
+    assert_eq!(node_b.chain.lock().await.height(), 3, "B should be at height 3");
+
+    // Capture B's tip hash — all nodes must converge on this.
+    let b_tip = node_b.chain.lock().await.tip().hash_hex();
+
+    // Now connect the two nodes — A should reorg to B's longer chain.
+    node_a
+        .connect_to_peer("127.0.0.1:19022")
+        .await
+        .expect("A→B connection");
+
+    // Both nodes must reach height 3 (B's chain) within 20 s.
+    wait_sync(&[node_a.clone(), node_b.clone()], 3, 20).await;
+
+    // Both must share the same tip (B's chain).
+    let a_tip = node_a.chain.lock().await.tip().hash_hex();
+    assert_eq!(
+        a_tip, b_tip,
+        "after reorg A's tip must match B's longer chain"
+    );
+    // A's miner should have zero balance — its blocks were orphaned.
+    assert_eq!(
+        node_a.chain.lock().await.balance_of(MINER_A),
+        0,
+        "A's orphaned blocks must not contribute to balance after reorg"
+    );
+    // B's miner should have a positive balance — 3 blocks.
+    assert!(
+        node_a.chain.lock().await.balance_of(MINER_B) > 0,
+        "B's miner must have balance on the winning chain"
+    );
+}
