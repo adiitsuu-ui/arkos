@@ -11,11 +11,11 @@ const P2P_PORT: u16 = 8333;
 
 /// Hardcoded testnet bootstrap peers — last-resort fallback if DNS is down.
 /// Update these with real seed node IPs before mainnet launch.
-pub const BOOTSTRAP_PEERS: &[&str] = &["seed1.arkos.network:8333", "seed2.arkos.network:8333"];
+pub const BOOTSTRAP_PEERS: &[&str] = &["seed.arkosquantum.com:8333", "seed2.arkosquantum.com:8333"];
 
 /// Default DNS seeds for automatic peer discovery.
 /// Each hostname should resolve to multiple A records (one per seed node).
-pub const DEFAULT_DNS_SEEDS: &[&str] = &["seed.arkos.network", "seed2.arkos.network"];
+pub const DEFAULT_DNS_SEEDS: &[&str] = &["seed.arkosquantum.com", "seed2.arkosquantum.com"];
 
 /// Resolve a DNS seed hostname to a list of `ip:port` peer addresses.
 ///
